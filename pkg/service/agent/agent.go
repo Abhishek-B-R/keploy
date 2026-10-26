@@ -939,6 +939,14 @@ func (a *Agent) GetMockErrors(ctx context.Context) ([]models.UnmatchedCall, erro
 		}
 	}
 	errs, err := a.Proxy.GetMockErrors(ctx)
+	// Under the proven switch a miss names its destination as the recording
+	// does, as one charged to a test at its end does (sanitizedMiss): one
+	// upstream reads the same in every line of the run, whatever the read.
+	if provenswitch.On() {
+		for i := range errs {
+			errs[i] = a.asRecorded(errs[i])
+		}
+	}
 	if settleErr != nil && err == nil {
 		err = fmt.Errorf("%w: keploy could not tell that every call reached it: %v", models.ErrUnmatchedCallsUnread, settleErr)
 	}
@@ -948,14 +956,6 @@ func (a *Agent) GetMockErrors(ctx context.Context) ([]models.UnmatchedCall, erro
 		// that could not vouch for every miss is answered with what it read,
 		// the charged misses included.
 		return errs, err
-	}
-	// Under the proven switch a miss names its destination as the recording
-	// does, as one charged to a test at its end does (sanitizedMiss): one
-	// upstream reads the same in every line of the run.
-	if provenswitch.On() {
-		for i := range errs {
-			errs[i] = a.asRecorded(errs[i])
-		}
 	}
 	// The misses the proven wire charged to a test at its end were drained
 	// from the proxy then; they are still the run's misses.
