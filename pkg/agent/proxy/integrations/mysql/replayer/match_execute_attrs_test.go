@@ -136,7 +136,7 @@ func TestMatchCommand_AnExecuteWithAnotherTraceparentMatchesItsRecording(t *test
 			dctx.StmtIDToQuery[33] = ordersInsert
 			dctx.PreparedStatements[33] = &mysql.StmtPrepareOkPacket{StatementID: 33, NumParams: 2}
 			ctx := context.WithValue(context.Background(), models.ClientConnectionIDKey, "0")
-			resp, ok, miss, err := matchCommand(ctx, zap.NewNop(), req, db, dctx, eng(), nil)
+			resp, ok, miss, err := matchCommand(ctx, zap.NewNop(), req, db, dctx, "", eng(), nil)
 			if err != nil || !ok || resp.Payload != "row-k1" {
 				t.Fatalf("served %v (ok %v, %v, miss %+v), want the recording of k1", resp, ok, err, miss)
 			}
@@ -179,7 +179,7 @@ func TestMatchCommand_AnExecuteNamingItsOwnParametersIsMatchedOnThem(t *testing.
 	dctx.StmtIDToQuery[33] = ordersInsert
 	dctx.PreparedStatements[33] = &mysql.StmtPrepareOkPacket{StatementID: 33, NumParams: 2}
 	ctx := context.WithValue(context.Background(), models.ClientConnectionIDKey, "0")
-	resp, ok, miss, err := matchCommand(ctx, zap.NewNop(), req, db, dctx, nil, nil)
+	resp, ok, miss, err := matchCommand(ctx, zap.NewNop(), req, db, dctx, "", nil, nil)
 	if err != nil || !ok || resp.Payload != "row-k1" {
 		t.Fatalf("served %v (ok %v, %v, miss %+v), want the recording of k1", resp, ok, err, miss)
 	}
@@ -229,7 +229,7 @@ func TestMatchCommand_StrictComparesAnExecuteNamingItsOwnParameters(t *testing.T
 		dctx.StmtIDToQuery[33] = ordersInsert
 		dctx.PreparedStatements[33] = &mysql.StmtPrepareOkPacket{StatementID: 33, NumParams: 2}
 		ctx := context.WithValue(context.Background(), models.ClientConnectionIDKey, "0")
-		resp, ok, _, err := matchCommand(ctx, zap.NewNop(), req, db, dctx, schemanoise.New(mysqlNoiseAdapter{}, false, true), nil)
+		resp, ok, _, err := matchCommand(ctx, zap.NewNop(), req, db, dctx, "", schemanoise.New(mysqlNoiseAdapter{}, false, true), nil)
 		if err != nil || ok {
 			t.Errorf("traced %v: strict served %v (%v) for a value recorded nowhere", traced, resp, err)
 		}
@@ -249,7 +249,7 @@ func TestMatchCommand_StrictComparesTheAttributesAnExecuteReads(t *testing.T) {
 	dctx.StmtIDToQuery[33] = reads
 	dctx.PreparedStatements[33] = &mysql.StmtPrepareOkPacket{StatementID: 33, NumParams: 1}
 	ctx := context.WithValue(context.Background(), models.ClientConnectionIDKey, "0")
-	resp, ok, miss, err := matchCommand(ctx, zap.NewNop(), req, db, dctx, schemanoise.New(mysqlNoiseAdapter{}, false, true), nil)
+	resp, ok, miss, err := matchCommand(ctx, zap.NewNop(), req, db, dctx, "", schemanoise.New(mysqlNoiseAdapter{}, false, true), nil)
 	if err != nil || ok {
 		t.Fatalf("strict served %v (%v): the statement reads a traceparent the replay changed", resp, err)
 	}
@@ -274,7 +274,7 @@ func TestMatchCommand_AnExecuteNamingItsOwnParametersWhosePrepareWasPrunedIsNotA
 	dctx.StmtIDToQuery[33] = ordersInsert
 	dctx.PreparedStatements[33] = &mysql.StmtPrepareOkPacket{StatementID: 33, NumParams: 2}
 	ctx := context.WithValue(context.Background(), models.ClientConnectionIDKey, "0")
-	resp, ok, miss, err := matchCommand(ctx, zap.NewNop(), req, db, dctx, nil, nil)
+	resp, ok, miss, err := matchCommand(ctx, zap.NewNop(), req, db, dctx, "", nil, nil)
 	if err != nil || ok {
 		t.Fatalf("served %v (%v): test B's own EXECUTE lost its statement, and another test's mock answered for it", resp, err)
 	}
@@ -349,7 +349,7 @@ func TestMatchCommand_StrictSplitsARecordingByItsPreparedStatement(t *testing.T)
 		dctx.StmtIDToQuery[33] = ordersInsert
 		dctx.PreparedStatements[33] = &mysql.StmtPrepareOkPacket{StatementID: 33, NumParams: 2}
 		ctx := context.WithValue(context.Background(), models.ClientConnectionIDKey, "0")
-		resp, ok, miss, err := matchCommand(ctx, zap.NewNop(), req, db, dctx, schemanoise.New(mysqlNoiseAdapter{}, false, true), nil)
+		resp, ok, miss, err := matchCommand(ctx, zap.NewNop(), req, db, dctx, "", schemanoise.New(mysqlNoiseAdapter{}, false, true), nil)
 		switch {
 		case err != nil:
 			t.Fatalf("%s: %v", key, err)
@@ -377,7 +377,7 @@ func TestMatchCommand_StrictComparesTheAttributesTheLiveStatementReads(t *testin
 	dctx.StmtIDToQuery[33] = reads
 	dctx.PreparedStatements[33] = &mysql.StmtPrepareOkPacket{StatementID: 33, NumParams: 1}
 	ctx := context.WithValue(context.Background(), models.ClientConnectionIDKey, "0")
-	resp, ok, _, err := matchCommand(ctx, zap.NewNop(), req, db, dctx, schemanoise.New(mysqlNoiseAdapter{}, false, true), nil)
+	resp, ok, _, err := matchCommand(ctx, zap.NewNop(), req, db, dctx, "", schemanoise.New(mysqlNoiseAdapter{}, false, true), nil)
 	if err != nil || ok {
 		t.Fatalf("strict served %v (%v): the live statement reads a traceparent the replay changed", resp, err)
 	}
@@ -401,7 +401,7 @@ func TestMatchCommand_ATracedExecuteNamingItsOwnParametersWhosePrepareWasPrunedI
 	dctx.StmtIDToQuery[33] = ordersInsert
 	dctx.PreparedStatements[33] = &mysql.StmtPrepareOkPacket{StatementID: 33, NumParams: 2}
 	ctx := context.WithValue(context.Background(), models.ClientConnectionIDKey, "0")
-	resp, ok, miss, err := matchCommand(ctx, zap.NewNop(), req, db, dctx, nil, nil)
+	resp, ok, miss, err := matchCommand(ctx, zap.NewNop(), req, db, dctx, "", nil, nil)
 	if err != nil || ok {
 		t.Fatalf("served %v (%v): test B's own EXECUTE lost its statement, and another test's mock answered for it", resp, err)
 	}
@@ -425,7 +425,7 @@ func TestMatchCommand_LearnsTheDriftOfAnAttributeAnExecuteReads(t *testing.T) {
 	dctx.StmtIDToQuery[33] = reads
 	dctx.PreparedStatements[33] = &mysql.StmtPrepareOkPacket{StatementID: 33, NumParams: 1}
 	ctx := context.WithValue(context.Background(), models.ClientConnectionIDKey, "0")
-	if _, _, _, err := matchCommand(ctx, zap.NewNop(), req, db, dctx, schemanoise.New(mysqlNoiseAdapter{}, true, false), nil); err != nil {
+	if _, _, _, err := matchCommand(ctx, zap.NewNop(), req, db, dctx, "", schemanoise.New(mysqlNoiseAdapter{}, true, false), nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := db.learned["body.parameters.1.value"]; !ok {
@@ -488,7 +488,7 @@ func TestMatchCommand_AnAutoReplayLearnsTheDriftStrictCompares(t *testing.T) {
 			dctx.PreparedStatements[33] = &mysql.StmtPrepareOkPacket{StatementID: 33, NumParams: tc.params}
 			ctx := context.WithValue(context.Background(), models.ClientConnectionIDKey, "0")
 			db := &learnedNoiseDb{fakeMockDb: &fakeMockDb{session: session, winStart: at.Add(-time.Second), winEnd: at.Add(time.Second)}}
-			if _, ok, _, err := matchCommand(ctx, zap.NewNop(), tc.live(), db, dctx, schemanoise.New(mysqlNoiseAdapter{}, true, false), nil); err != nil || !ok {
+			if _, ok, _, err := matchCommand(ctx, zap.NewNop(), tc.live(), db, dctx, "", schemanoise.New(mysqlNoiseAdapter{}, true, false), nil); err != nil || !ok {
 				t.Fatalf("the auto-replay served nothing (%v)", err)
 			}
 			if _, ok := db.learned[tc.want]; !ok || len(db.learned) != 1 {
@@ -496,7 +496,7 @@ func TestMatchCommand_AnAutoReplayLearnsTheDriftStrictCompares(t *testing.T) {
 			}
 			m.Spec.ReqBodyNoise = db.learned
 			strictDb := &fakeMockDb{session: session, winStart: at.Add(-time.Second), winEnd: at.Add(time.Second)}
-			if resp, ok, miss, err := matchCommand(ctx, zap.NewNop(), tc.live(), strictDb, dctx, schemanoise.New(mysqlNoiseAdapter{}, false, true), nil); err != nil || !ok {
+			if resp, ok, miss, err := matchCommand(ctx, zap.NewNop(), tc.live(), strictDb, dctx, "", schemanoise.New(mysqlNoiseAdapter{}, false, true), nil); err != nil || !ok {
 				t.Errorf("strict, after the auto-replay, served %v (%v, miss %+v)", resp, err, miss)
 			}
 		})
@@ -533,12 +533,12 @@ func TestMatchCommand_ANamedRecordingOfAnotherStatementIsNotAnExecuteWithNoParam
 	ctx := context.WithValue(context.Background(), models.ClientConnectionIDKey, "0")
 	for _, traced := range []bool{false, true} {
 		db := &fakeMockDb{session: []*models.Mock{insert(traced)}, winStart: at.Add(-time.Second), winEnd: at.Add(time.Second)}
-		if resp, ok, _, err := matchCommand(ctx, zap.NewNop(), live(traced), db, dctx, schemanoise.New(mysqlNoiseAdapter{}, false, true), nil); err != nil || ok {
+		if resp, ok, _, err := matchCommand(ctx, zap.NewNop(), live(traced), db, dctx, "", schemanoise.New(mysqlNoiseAdapter{}, false, true), nil); err != nil || ok {
 			t.Errorf("traced %v: strict served %v (%v) for %q", traced, resp, err, count)
 		}
 		own := executedMock("mock-count", 5, stmtT0, "count-row", count)
 		db = &fakeMockDb{session: []*models.Mock{own, insert(traced)}, winStart: at.Add(-time.Second), winEnd: at.Add(time.Second)}
-		if resp, ok, miss, err := matchCommand(ctx, zap.NewNop(), live(traced), db, dctx, nil, nil); err != nil || !ok || resp.Payload != "count-row" {
+		if resp, ok, miss, err := matchCommand(ctx, zap.NewNop(), live(traced), db, dctx, "", nil, nil); err != nil || !ok || resp.Payload != "count-row" {
 			t.Errorf("traced %v: served %v (ok %v, %v, miss %+v), want the statement's own recording", traced, resp, ok, err, miss)
 		}
 	}
@@ -562,7 +562,7 @@ func TestMatchCommand_StrictComparesTheAttributesTheRecordedStatementReads(t *te
 		db := &fakeMockDb{session: []*models.Mock{m}, winStart: at.Add(-time.Second), winEnd: at.Add(time.Second)}
 		req := liveExecute("k1")
 		withAttrs(req.Message.(*mysql.StmtExecutePacket), traceparentAttr(tp))
-		resp, ok, _, err := matchCommand(ctx, zap.NewNop(), req, db, dctx, schemanoise.New(mysqlNoiseAdapter{}, false, true), nil)
+		resp, ok, _, err := matchCommand(ctx, zap.NewNop(), req, db, dctx, "", schemanoise.New(mysqlNoiseAdapter{}, false, true), nil)
 		if err != nil || ok {
 			t.Errorf("live traceparent %s: strict served %v (%v), a recording of a statement that reads its attributes", tp, resp, err)
 		}

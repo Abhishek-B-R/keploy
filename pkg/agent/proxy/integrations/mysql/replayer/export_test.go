@@ -42,7 +42,7 @@ func MatchForTest(ctx context.Context, logger *zap.Logger, req mysql.Request, db
 // MatchWithEngineForTest is MatchForTest with the schema-noise engine eng
 // (StrictEngineForTest: strict enforcement).
 func MatchWithEngineForTest(ctx context.Context, logger *zap.Logger, req mysql.Request, db integrations.MockMemDb, dctx *wire.DecodeContext, eng *schemanoise.Engine) (*mysql.Response, bool, string, error) {
-	resp, ok, miss, err := matchCommand(ctx, logger, req, db, dctx, eng, nil)
+	resp, ok, miss, err := matchCommand(ctx, logger, req, db, dctx, "", eng, nil)
 	missText := ""
 	if miss != nil {
 		missText = fmt.Sprintf("%+v", *miss)
