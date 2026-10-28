@@ -4632,17 +4632,17 @@ func (a *AgentClient) PushSetTable(ctx context.Context, root string, sets map[st
 // table and each key's pool slice (models.ScopeTableReq.Pool) in one
 // request. Every answer but 200 is an error: a replay judged per test must
 // not run on an agent that serves its tests and pool otherwise.
-func (a *AgentClient) PushProvenTable(ctx context.Context, table, pool map[string][]string) (retErr error) {
+func (a *AgentClient) PushProvenTable(ctx context.Context, table, pool map[string][]string, given map[string][]models.GivenValue) (retErr error) {
 	if pool == nil {
 		pool = map[string][]string{}
 	}
 	defer func() {
 		if retErr == nil && a.session().recording() {
-			t, p := maps.Clone(table), maps.Clone(pool)
-			a.session().record(stepScopeTable, func(c context.Context) error { return a.PushProvenTable(c, t, p) })
+			t, p, g := maps.Clone(table), maps.Clone(pool), maps.Clone(given)
+			a.session().record(stepScopeTable, func(c context.Context) error { return a.PushProvenTable(c, t, p, g) })
 		}
 	}()
-	body, err := json.Marshal(models.ScopeTableReq{Mappings: table, Pool: pool})
+	body, err := json.Marshal(models.ScopeTableReq{Mappings: table, Pool: pool, Given: given})
 	if err != nil {
 		return fmt.Errorf("failed to marshal scope table: %w", err)
 	}

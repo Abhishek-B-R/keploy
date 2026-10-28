@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"go.keploy.io/server/v3/config"
+	"go.keploy.io/server/v3/pkg/models"
 	"go.keploy.io/server/v3/pkg/provenswitch"
 	"go.uber.org/zap"
 )
@@ -76,20 +77,55 @@ func TestAgentClient_PushProvenTable(t *testing.T) {
 	defer srv.Close()
 	a := &AgentClient{logger: zap.NewNop(), client: http.Client{}, conf: &config.Config{Agent: config.Agent{AgentURI: srv.URL}}}
 	ctx := context.Background()
-	if err := a.PushProvenTable(ctx, map[string][]string{"o::TestA": {"mock-3"}}, map[string][]string{"o": {"mock-1"}}); err != nil {
+	if err := a.PushProvenTable(ctx, map[string][]string{"o::TestA": {"mock-3"}}, map[string][]string{"o": {"mock-1"}}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.PushProvenTable(ctx, map[string][]string{"o::TestA": {}}, nil); err != nil {
+	if err := a.PushProvenTable(ctx, map[string][]string{"o::TestA": {}}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{`{"mappings":{"o::TestA":["mock-3"]},"pool":{"o":["mock-1"]}}`, `{"mappings":{"o::TestA":[]},"pool":{}}`}
-	if len(bodies) != 2 || bodies[0] != want[0] || bodies[1] != want[1] {
+	// The values each test gave when it was recorded ride the same request.
+	given := map[string][]models.GivenValue{"o::TestA": {{Name: "given:nonce", Value: "1761", Source: "a_test.go:9"}}}
+	if err := a.PushProvenTable(ctx, map[string][]string{"o::TestA": {"mock-3"}}, nil, given); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		`{"mappings":{"o::TestA":["mock-3"]},"pool":{"o":["mock-1"]}}`,
+		`{"mappings":{"o::TestA":[]},"pool":{}}`,
+		`{"mappings":{"o::TestA":["mock-3"]},"pool":{},"given":{"o::TestA":[{"name":"given:nonce","value":"1761","source":"a_test.go:9"}]}}`,
+	}
+	if len(bodies) != 3 || bodies[0] != want[0] || bodies[1] != want[1] || bodies[2] != want[2] {
 		t.Fatalf("posted %q, want %q", bodies, want)
 	}
 	for _, s := range []int{http.StatusNotFound, http.StatusNotImplemented, http.StatusInternalServerError} {
 		status = s
-		if err := a.PushProvenTable(ctx, nil, nil); err == nil {
+		if err := a.PushProvenTable(ctx, nil, nil, nil); err == nil {
 			t.Fatalf("status %d: want an error", s)
 		}
+	}
+}
+
+// An agent docker compose starts again is handed the proven table once more,
+// the values each test gave when it was recorded included: without them
+// every given of the replay binds with no recorded value.
+func TestARestartedAgentGetsTheProvenTableWithItsGivens(t *testing.T) {
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+	}))
+	defer srv.Close()
+	s := storeSession(t, srv.URL, true)
+	a := &AgentClient{logger: zap.NewNop(), client: http.Client{}, conf: &config.Config{Agent: config.Agent{AgentURI: srv.URL}}}
+	given := map[string][]models.GivenValue{"o::TestA": {{Name: "given:nonce", Value: "1761", Source: "a_test.go:9"}}}
+	if err := a.PushProvenTable(context.Background(), map[string][]string{"o::TestA": {"mock-3"}}, nil, given); err != nil {
+		t.Fatal(err)
+	}
+	given["o::TestA"] = nil // the caller's map is its own
+	if err := s.reapply(context.Background(), zap.NewNop()); err != nil {
+		t.Fatal(err)
+	}
+	want := `{"mappings":{"o::TestA":["mock-3"]},"pool":{},"given":{"o::TestA":[{"name":"given:nonce","value":"1761","source":"a_test.go:9"}]}}`
+	if len(bodies) != 2 || bodies[0] != want || bodies[1] != want {
+		t.Fatalf("posted %q, want %q twice", bodies, want)
 	}
 }

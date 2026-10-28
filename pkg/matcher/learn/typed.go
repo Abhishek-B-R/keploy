@@ -486,6 +486,8 @@ func (dc *DriftCache) classifyInstant(r, l Leaf, at time.Time, served []Earlier,
 		ln.Kind, ln.From = KindVariable, from
 		return ln
 	}
+	// No other rule reads a value the test gave (classifyRead).
+	served = withoutGave(served)
 	// The echo, before any provenance excuses the instant.
 	if echoed := echoedPairs([]driftedInstant{{rec: rec, live: live}}, dc.earlierMoments(at, served, raw), dc.recordedMoments(at, served, raw)); len(echoed) > 0 {
 		if from, ok := dc.instantEchoFrom(r, echoed, at, served, raw); ok {
@@ -569,7 +571,8 @@ func (dc *DriftCache) classifyInstant(r, l Leaf, at time.Time, served []Earlier,
 // neither on its other side (it drifted with it, rule 1). Whole, of the
 // place, is its recorded text's being r's: where the value can be bound. The
 // test case's own request is such a place too, where keploy test sent a part
-// of it with template values (Earlier.Given): nothing binds there.
+// of it with template values (Earlier.Given): nothing binds there. A value
+// the test gave keploy (Earlier.Gave) is one only where its text is r's.
 func (dc *DriftCache) instantServedFrom(r Leaf, rec, live moment, served []Earlier) (Place, bool) {
 	var best Place
 	rank := 7
@@ -579,6 +582,11 @@ func (dc *DriftCache) instantServedFrom(r Leaf, rec, live moment, served []Earli
 				continue
 			}
 			whole := s.Leaf.Value == r.Value
+			if !whole && e.Gave {
+				// A value the test gave is the instant's place only where
+				// it is its text whole, never by a moment it names.
+				continue
+			}
 			if !whole && !dc.isInstant(s.Leaf.Value, rec) && !seenIs(s.Leaf, s.Leaf.Value, rec) && !dc.instantCoDrifted(s.Leaf.Value, s.Live, rec, live) {
 				continue
 			}

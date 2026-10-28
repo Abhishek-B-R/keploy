@@ -125,3 +125,21 @@ func TestAVariablesClockReadsRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// A variable's why (a given's: where the test gave it and how to undo it)
+// survives a merge: a's is kept, and one only b says is taken from b.
+func TestMergeVariablesKeepsAWhy(t *testing.T) {
+	for _, c := range []struct {
+		name, a, b, want string
+	}{
+		{"only b says why", "", "given by b", "given by b"},
+		{"only a says why", "given by a", "", "given by a"},
+		{"both say why", "given by a", "given by b", "given by a"},
+	} {
+		a := MockVariables{"given:nonce": {Recorded: "1", Use: []string{"body.name"}, Why: c.a}}
+		b := MockVariables{"given:nonce": {Recorded: "1", Use: []string{"url.query.n"}, Why: c.b}}
+		if got := MergeVariables(a, b)["given:nonce"]; got.Why != c.want || len(got.Use) != 2 {
+			t.Errorf("%s: merged why %q uses %v, want %q at both uses", c.name, got.Why, got.Use, c.want)
+		}
+	}
+}
