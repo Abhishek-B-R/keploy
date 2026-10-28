@@ -46,9 +46,14 @@ func ReadZone(root, tz string, set bool) (*time.Location, error) {
 // reads UTC there, or a copy of the zone built into it, and keploy cannot
 // tell which.
 func readZone(root, tz string, set, own bool) (*time.Location, error) {
+	return readZoneIn(dirFiles(root), tz, set, own)
+}
+
+// readZoneIn is readZone of the root whose files f gives.
+func readZoneIn(f ZoneFiles, tz string, set, own bool) (*time.Location, error) {
 	if !set {
-		loc, err := zoneFile(root, "/etc/localtime")
-		if err != nil && localtimeAbsent(root) {
+		loc, err := zoneFileIn(f, "/etc/localtime")
+		if err != nil && localtimeAbsentIn(f) {
 			// No /etc/localtime at all (an Alpine or distroless image):
 			// the C library, Go, Python and Node read UTC.
 			return time.UTC, nil
@@ -60,11 +65,11 @@ func readZone(root, tz string, set, own bool) (*time.Location, error) {
 	case tz == "" || tz == "UTC":
 		return time.UTC, nil
 	case strings.HasPrefix(tz, "/"):
-		return zoneFile(root, tz)
+		return zoneFileIn(f, tz)
 	}
-	_, rerr := resolveUnder(root, "/usr/share/zoneinfo/"+tz)
+	_, rerr := resolveIn(f, "/usr/share/zoneinfo/"+tz)
 	if rerr == nil && !strings.Contains(tz, "..") {
-		return zoneFile(root, "/usr/share/zoneinfo/"+tz)
+		return zoneFileIn(f, "/usr/share/zoneinfo/"+tz)
 	}
 	if !own {
 		if rerr != nil && !absent(rerr) && !isLasting(rerr) {
@@ -1062,7 +1067,12 @@ func procZoneFrom(ctx context.Context) (ProcZone, bool) {
 // not there (a link to nothing) is an error, as Go and the C library read
 // UTC there, never the zone its link names.
 func zoneFile(root, name string) (*time.Location, error) {
-	data, final, err := readZoneFile(root, name)
+	return zoneFileIn(dirFiles(root), name)
+}
+
+// zoneFileIn is zoneFile of the root whose files f gives.
+func zoneFileIn(f ZoneFiles, name string) (*time.Location, error) {
+	data, final, err := readZoneFileIn(f, name)
 	if absent(err) {
 		// A link to nothing: lasting (lastingError).
 		return nil, lasting(err)
@@ -1074,10 +1084,10 @@ func zoneFile(root, name string) (*time.Location, error) {
 			return loadZone(zn, data)
 		}
 	}
-	if b, err := readUnder(root, "/etc/timezone"); err == nil {
+	if b, err := readUnderIn(f, "/etc/timezone"); err == nil {
 		zn := strings.TrimSpace(string(b))
 		if zn != "" && !strings.Contains(zn, "..") {
-			if same, err := readUnder(root, "/usr/share/zoneinfo/"+zn); err == nil && bytes.Equal(same, data) {
+			if same, err := readUnderIn(f, "/usr/share/zoneinfo/"+zn); err == nil && bytes.Equal(same, data) {
 				return loadZone(zn, data)
 			}
 		}
@@ -1138,11 +1148,16 @@ func under(root, p string) string {
 // under root, each link on it resolved in that view (resolveUnder): its
 // bytes and the path, in that view, of the file they were read from.
 func readZoneFile(root, p string) ([]byte, string, error) {
-	real, err := resolveUnder(root, p)
+	return readZoneFileIn(dirFiles(root), p)
+}
+
+// readZoneFileIn is readZoneFile of the root whose files f gives.
+func readZoneFileIn(f ZoneFiles, p string) ([]byte, string, error) {
+	real, err := resolveIn(f, p)
 	if err != nil {
 		return nil, "", err
 	}
-	data, err := readRegular(root, real)
+	data, err := readRegularIn(f, real)
 	return data, real, err
 }
 
@@ -1163,12 +1178,17 @@ func (e errNotRegular) Error() string {
 // read, a device, whose driver's open would run, a directory), never
 // opened for reading (openRegular), or of a longer one.
 func readRegular(root, p string) ([]byte, error) {
-	f, err := openRegular(root, p)
+	return readRegularIn(dirFiles(root), p)
+}
+
+// readRegularIn is readRegular of the root whose files f gives.
+func readRegularIn(f ZoneFiles, p string) ([]byte, error) {
+	r, err := f.OpenRegular(p)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = f.Close() }()
-	data, err := io.ReadAll(io.LimitReader(f, zoneFileCap+1))
+	defer func() { _ = r.Close() }()
+	data, err := io.ReadAll(io.LimitReader(r, zoneFileCap+1))
 	if err == nil && len(data) > zoneFileCap {
 		err = lasting(fmt.Errorf("more than %d bytes, more than keploy reads of a zone file, an /etc/timezone or an argfile", zoneFileCap))
 	}
@@ -1178,7 +1198,12 @@ func readRegular(root, p string) ([]byte, error) {
 // readUnder reads the file at p, a path in the process's own view, under
 // root (readZoneFile).
 func readUnder(root, p string) ([]byte, error) {
-	data, _, err := readZoneFile(root, p)
+	return readUnderIn(dirFiles(root), p)
+}
+
+// readUnderIn is readUnder of the root whose files f gives.
+func readUnderIn(f ZoneFiles, p string) ([]byte, error) {
+	data, _, err := readZoneFileIn(f, p)
 	return data, err
 }
 
@@ -1186,18 +1211,22 @@ func readUnder(root, p string) ([]byte, error) {
 // a link to nothing, which the C library reads as UTC too, but keploy
 // refuses as a zone it cannot tell).
 func localtimeAbsent(root string) bool {
-	etc, err := resolveUnder(root, "/etc")
+	return localtimeAbsentIn(dirFiles(root))
+}
+
+// localtimeAbsentIn is localtimeAbsent of the root whose files f gives.
+func localtimeAbsentIn(f ZoneFiles) bool {
+	etc, err := resolveIn(f, "/etc")
 	if err != nil {
 		return false
 	}
-	_, err = os.Lstat(under(root, path.Join(etc, "localtime")))
+	_, err = f.Lstat(path.Join(etc, "localtime"))
 	if !errors.Is(err, fs.ErrNotExist) {
 		return false
 	}
 	// An absence read in a root keploy can still read: an exited
 	// process's root reads as absent everywhere.
-	_, err = os.Stat(root)
-	return err == nil
+	return f.Readable()
 }
 
 // resolveUnder is p, a path in the process's own view, with each link on
@@ -1208,6 +1237,11 @@ func localtimeAbsent(root string) bool {
 // way from keploy's own /. An error where a link names nothing, or there
 // are too many.
 func resolveUnder(root, p string) (string, error) {
+	return resolveIn(dirFiles(root), p)
+}
+
+// resolveIn is resolveUnder of the root whose files f gives.
+func resolveIn(f ZoneFiles, p string) (string, error) {
 	rest := strings.Split(path.Clean("/"+p), "/")
 	cur, links := "/", 0
 	for len(rest) > 0 {
@@ -1221,18 +1255,18 @@ func resolveUnder(root, p string) (string, error) {
 			continue
 		}
 		next := path.Join(cur, c)
-		fi, err := os.Lstat(under(root, next))
+		mode, err := f.Lstat(next)
 		if err != nil {
 			return "", err
 		}
-		if fi.Mode()&os.ModeSymlink == 0 {
+		if mode&fs.ModeSymlink == 0 {
 			cur = next
 			continue
 		}
 		if links++; links > 40 {
 			return "", lasting(errors.New("too many links on the path " + p))
 		}
-		target, err := os.Readlink(under(root, next))
+		target, err := f.Readlink(next)
 		if err != nil {
 			return "", err
 		}
