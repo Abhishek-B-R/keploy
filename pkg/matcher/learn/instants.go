@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"go.keploy.io/server/v3/pkg/models"
@@ -272,12 +273,24 @@ func isEpochText(s string) bool {
 	return dot
 }
 
+// instantReads counts the texts instantSpans has read, in this process.
+var instantReads atomic.Int64
+
+// InstantReads is how many texts the learn step has read for their instants
+// in this process: each read is a scan by every clock layout, the step's
+// costliest read of an earlier payload. A row at the agent's level reads it
+// around a call to tell what the call read of the set's payloads apart from
+// the set's size (proxy: a pooled connection keeps being answered after a
+// test boundary).
+func InstantReads() int64 { return instantReads.Load() }
+
 // instantSpans are the instants s holds: each a match of a layout of
 // clockLayouts, in either case, at ASCII word boundaries, that its layout
 // reads as an instant, no two overlapping (an earlier layout's first, as
 // clockIn takes them), in the order they stand. A time-ordered UUID's span is
 // its time groups, unkeyed.
 var instantSpans = func(s string) []instant {
+	instantReads.Add(1)
 	var out []instant
 	var taken []bool
 	for k, re := range instantRes {
