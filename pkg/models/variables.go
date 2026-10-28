@@ -1,9 +1,14 @@
 package models
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	// A replay reads a ClockOffset's AppZone on any machine, one with no
+	// zone files too (ZoneLocation).
+	_ "time/tzdata"
 )
 
 // MockVariables names, by variable, the places of a recorded dependency call
@@ -137,56 +142,69 @@ func (r ClockRead) inOneSecond(o ClockRead) bool {
 // bounded to a few milliseconds, never to a few minutes. Min is above zero
 // and Unit coarser than a second for any offset the learn step finds.
 //
-// Res is the resolution the learn step read the value at: of an offset, the
-// coarser of the one its encoding writes and the granularity both runs'
-// values share (the greatest duration both are whole multiples of, from the
-// Unix epoch); of a Plain read, the one its encoding writes, or, where both
-// values are a cut the application made (CutCoarserThan), the unit above it
-// (UnitAbove), never what the two share by chance (learn's readRes), so the
-// same recording learns the same Res whichever value record's full round
-// read. Of a text or a number, the encoding's is the finer of the two
-// values' forms (learn's textReadRes): a writer that drops a fraction's
-// trailing zeros writes fewer digits where its read fell on a whole unit, so
-// a fraction's digits bound its writer's resolution from above only, and one
-// value that happens to end in zeros never coarsens Res. Two that both
-// happen to end in zeros at a unit (one field in about a million, on a
-// clock of nanoseconds) are read at that unit, and a replay's value with
-// more digits is refused as a cut: a false red, the same at every replay of
-// that recording, never a pass.
-// An application that cuts its value coarser than its encoding
-// (Truncate(time.Second) stored as a millisecond $date) shows that cut in
-// both values, and the sums that decide whether a replay can compare the
-// offset (Within, at the learn step and in Holds) count it, never the
-// encoding's finer one: a value cut to the minute, its time to live thirty
-// minutes, read late in its minute stands only thirty minutes and a
-// fraction of a second from its read even with a time to live of
-// thirty-one, and a resolution of a millisecond would hold it. Res is read
-// only in those sums and in the refusal of a cut (CutCoarserThan), so only
-// to refuse more: two values that happen to
-// share a coarser granularity make it coarser, never finer, the learn step
-// bounds Min and Max at the encoding's resolution, not at Res, and Holds
-// reads the replay's value at the replay's own resolution, not at Res. A
-// Res that is a cut the application made (CutCoarserThan: a whole number of
-// the unit above the encoding's, a value cut to the second stored at the
-// millisecond) is never learned: read at its encoding's resolution, a
-// replay's value cut so would hold only where its read falls early in its
-// cut, by when the replay ran, and keploy does not read the application's
-// cut from two values to hold it anywhere. Nor are two values a whole
-// number of that unit apart (learn's apartByUnits): a cut to it plus a time
-// to live that is no whole number of cuts, which Res does not show.
+// Res is the resolution the learn step read the value at. Of an offset, the
+// one its encoding writes, or the cut its two values show (founder decision,
+// 2026-10-27; a clock read plus a constant offset, then cut, is a clock
+// read, 2026-10-28): the coarsest step of CutOf above the encoding that both
+// values, or the gap between them, are whole multiples of (an application
+// that cuts its value and then adds a time to live that is no whole number
+// of cuts, 30m30s after a minute's start, puts its two values a whole number
+// of cuts apart, though neither is a whole cut), no coarser than a minute
+// (learn's offsetReading: a cut to an hour or a day, which a zone's offset
+// moves, shows no offset). The learn step bounds Min and Max at it, as
+// standing for its whole cut (truncated: a value v stands for reads from v
+// up to v plus Res), and the sums that decide whether a replay can compare
+// the offset (Within, at the learn step and in Holds) count it, so thirty
+// minutes cut to the minute, which a replay could not tell from thirty-one,
+// is refused as too wide, and thirty days cut to the second is learned.
+// Holds checks a replay's value at Res where it is such a step coarser than
+// the value's own encoding (a cut), as standing for its whole cut, within
+// one Res of the call's span plus the offset on either side, as a plain
+// read's; at the value's own resolution otherwise. A Res learned before
+// cuts were (the granularity two values shared by chance, 500 ms or 2 s) is
+// no step: Holds reads it only in its sums, to refuse more.
+//
+// Of a Plain read, Res is the resolution its encoding writes, or, where both
+// values are whole multiples of a step above it (CutOf: a unit, or a
+// decimal step between units, such as 10 ms or 100 µs), the coarsest such
+// step: a cut, the application's or one both values fell on by chance,
+// never a span the two share between steps (492 ms), so the same recording
+// learns the same Res whichever value record's full round read. Of a text
+// or a number, the encoding's is the finer of the two values' forms (learn's
+// textReadRes): a writer that drops a fraction's trailing zeros writes fewer
+// digits where its read fell on a whole unit, so a fraction's digits bound
+// its writer's resolution from above only, and one value that happens to
+// end in zeros never coarsens Res. A cut, of any step (founder decision,
+// 2026-10-27), is learned, never refused: a value cut to the second, the
+// minute, the day, or to 10 or 100 ms. A replay reads a Plain Res above its
+// value's encoding as a cut only where its value is a whole multiple of a
+// step above its encoding, no coarser than Res, too (CutOf; learn's
+// CheckClockRead): one that is, is checked at that cut, as standing for its
+// whole cut: it holds within one cut of the call's span on either side (a
+// value v cut to c, where the start of the cut that holds from, less c, <=
+// v <= to+c: holdsRead); one that is not is checked so at its own
+// resolution, which is stricter. A value read in the call's span holds
+// either way, wherever its read fell in its cut, cut down or rounded, and so
+// does one up to one cut stale or ahead. Both the learn step and a replay
+// read a cut in UTC, in the offset the value writes, and in the
+// application's zone (learn's zonedRes, CheckClockRead), so an hour or a
+// day the application cuts in its own zone (an hour in UTC+05:30, a day in
+// UTC+02:00) is read as one.
 //
 // Zone says in which zone a replay reads the value at the place, where the
 // learn step learned a wall clock of no zone there (a text, or a type of its
 // protocol, that names no zone: "2026-10-27 09:00:00", a Postgres
-// timestamp): ZoneUTC in UTC, ZoneApp in the application's own zone, as
-// the replay's tracker knows it (learn.Span.Zone); ZoneEither in either of
+// timestamp): ZoneUTC in UTC, ZoneApp in the application's own zone, the
+// one the replay reads from the application's process, else the one
+// AppZone names, else as the replay's tracker knows it (learn.Span); ZoneEither in either of
 // the two, where the recording could not tell them apart at the value's
 // resolution (a date whose day is one in both zones at its call, or an
 // application whose zone is UTC there); "" for a value that names its
 // moment, read as it names it, as a recording learned before Zone was read
 // is. A replay reads a wall clock of no zone only under ZoneUTC, ZoneApp or
 // ZoneEither, the zones the learn step read it in, and refuses one under
-// ZoneApp or ZoneEither where it cannot tell the application's zone, so it
+// ZoneApp or ZoneEither that names no AppZone where it cannot tell the
+// application's zone, so it
 // never checks a value in a zone the learn step did not read it in.
 // ZoneApart is the Meet of two learnings that read the place in zones no
 // one zone holds, which holds nothing (Empty), and so does a Zone this
@@ -210,12 +228,148 @@ func (r ClockRead) inOneSecond(o ClockRead) bool {
 // was, which a replay reads in any layout, as it did then. LayoutApart is
 // the Meet of two learnings that saw the place in different layouts, which
 // holds nothing (Empty).
+//
+// AppZone names the application's zone the learn step read the value in,
+// where what it learned depends on that zone (AppZoneMatters): a wall clock
+// of no zone read in it (ZoneApp, ZoneEither), or a value that names its
+// moment cut coarser than a minute, to an hour or a day, which a zone's
+// offset moves (an hour in UTC+05:30 is no hour in UTC). It is "UTC" or a
+// fixed offset ("+05:30") of a zone with no change of offset ahead, else
+// an IANA name ("Europe/Berlin"), as ZoneNameOf names it (ZoneLocation
+// reads each). A replay reads the application's zone as
+// the one its process writes its clock in in that run, where keploy reads
+// it from the process (a wall clock of no zone is the application's own),
+// else as AppZone, on any machine, never as the agent's own (learn's
+// CheckClockRead): a recording learned on a laptop in IST checks the same
+// cut in IST on a CI machine in UTC whose application's zone keploy cannot
+// read, and in UTC where it reads the application now writing in UTC.
+// "" in a recording learned before AppZone was, where keploy could not read
+// the zone of the process that made the call, or where it could not name
+// the zone (a zone file copied with no name, whose offset changes): a
+// replay that cannot read the application's zone either refuses a plain
+// read cut to an hour or coarser, and reads any other as its tracker knows
+// the zone, as before. Two learnings of one place in different named zones meet as
+// ZoneApart (Meet), which holds nothing.
 type ClockOffset struct {
-	Min    time.Duration `json:"min" yaml:"min" bson:"min"`
-	Max    time.Duration `json:"max" yaml:"max" bson:"max"`
-	Res    time.Duration `json:"res" yaml:"res" bson:"res"`
-	Zone   string        `json:"zone,omitempty" yaml:"zone,omitempty" bson:"zone,omitempty"`
-	Layout string        `json:"layout,omitempty" yaml:"layout,omitempty" bson:"layout,omitempty"`
+	Min     time.Duration `json:"min" yaml:"min" bson:"min"`
+	Max     time.Duration `json:"max" yaml:"max" bson:"max"`
+	Res     time.Duration `json:"res" yaml:"res" bson:"res"`
+	Zone    string        `json:"zone,omitempty" yaml:"zone,omitempty" bson:"zone,omitempty"`
+	Layout  string        `json:"layout,omitempty" yaml:"layout,omitempty" bson:"layout,omitempty"`
+	AppZone string        `json:"app_zone,omitempty" yaml:"app_zone,omitempty" bson:"app_zone,omitempty"`
+}
+
+// AppZoneMatters reports whether what the learn step learned of o depends
+// on the application's zone, so it names that zone in AppZone: a wall clock
+// of no zone read in it (ZoneApp, ZoneEither), or a plain read of a value
+// that names its moment cut coarser than a minute (an hour, a day), whose
+// cut a replay reads in the application's zone beside UTC and the offset it
+// writes (learn's cutZones). A minute or any finer cut is one in every zone
+// (zones' offsets are whole minutes); a wall clock read in UTC (ZoneUTC) is
+// cut in UTC alone.
+func (o ClockOffset) AppZoneMatters() bool {
+	return o.Zone == ZoneApp || o.Zone == ZoneEither || o.Zone == "" && o.Plain() && o.Res > time.Minute
+}
+
+// ZoneLocation is the zone name names (ClockOffset.AppZone): "UTC", a fixed
+// offset ("+05:30", "-03:00") or an IANA name ("Asia/Kolkata"), read from
+// the host's zone files, else from the ones built into keploy (time/tzdata),
+// so a replay reads it on any machine. An error for any other name.
+func ZoneLocation(name string) (*time.Location, error) {
+	if name == "UTC" {
+		return time.UTC, nil
+	}
+	if len(name) == 6 && (name[0] == '+' || name[0] == '-') && name[3] == ':' {
+		h, herr := strconv.Atoi(name[1:3])
+		m, merr := strconv.Atoi(name[4:6])
+		if herr != nil || merr != nil || h > 14 || m > 59 || !isDigits(name[1:3]) || !isDigits(name[4:6]) {
+			return nil, fmt.Errorf("%q is no fixed offset keploy reads", name)
+		}
+		off := h*3600 + m*60
+		if name[0] == '-' {
+			off = -off
+		}
+		return time.FixedZone(name, off), nil
+	}
+	if name == "" || name == "Local" {
+		return nil, fmt.Errorf("%q names no zone", name)
+	}
+	if loc, ok := zoneLocations.Load(name); ok {
+		return loc.(*time.Location), nil
+	}
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		return nil, err
+	}
+	zoneLocations.Store(name, loc)
+	return loc, nil
+}
+
+// zoneLocations are the IANA zones ZoneLocation has read, by name: a
+// replay checks a place's AppZone at every call, and reads its file once.
+var zoneLocations sync.Map
+
+// sameZoneAt reports whether a and b write at with one offset and next
+// change it at one instant (time.Time.ZoneBounds; none in either).
+func sameZoneAt(a, b *time.Location, at time.Time) bool {
+	ta, tb := at.In(a), at.In(b)
+	_, oa := ta.Zone()
+	_, ob := tb.Zone()
+	_, ea := ta.ZoneBounds()
+	_, eb := tb.ZoneBounds()
+	return oa == ob && ea.Equal(eb)
+}
+
+// isDigits reports whether s is ASCII digits alone (strconv.Atoi takes a
+// sign, which a fixed offset's hours or minutes never carry).
+func isDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return s != ""
+}
+
+// ZoneNameOf is the name ClockOffset.AppZone stores for loc, which
+// ZoneLocation reads back as the same zone from at on: of a zone whose
+// offset never changes after at, "UTC" or its fixed offset ("+05:30" of
+// Asia/Kolkata, its alias Asia/Calcutta, or a zone file copied with no
+// name), so names of one such zone are one name (Etc/UTC and UTC); of one
+// whose offset changes, its IANA name ("Europe/Berlin"); "" where it has
+// none keploy reads back as it (a zone file of summer time copied with no
+// name) or loc is nil.
+func ZoneNameOf(loc *time.Location, at time.Time) string {
+	if loc == nil {
+		return ""
+	}
+	if loc == time.UTC {
+		return "UTC"
+	}
+	t := at.In(loc)
+	if _, end := t.ZoneBounds(); !end.IsZero() {
+		// A name another zone's file holds ("CET" of a rule IANA's CET
+		// does not follow) names loc only where the two agree at at and on
+		// its next change of offset.
+		if n := loc.String(); n != "" && n != "Local" {
+			if l, err := ZoneLocation(n); err == nil && sameZoneAt(l, loc, at) {
+				return n
+			}
+		}
+		return ""
+	}
+	_, off := t.Zone()
+	if off == 0 {
+		return "UTC"
+	}
+	sign := byte('+')
+	if off < 0 {
+		sign, off = '-', -off
+	}
+	if off%60 != 0 {
+		return ""
+	}
+	return fmt.Sprintf("%c%02d:%02d", sign, off/3600, off%3600/60)
 }
 
 // The layouts a ClockOffset's Layout names beside those of a text or a
@@ -370,34 +524,65 @@ func (o ClockOffset) Unit() time.Duration {
 	return 0
 }
 
-// CutCoarserThan reports whether o's Res is a cut the application made
-// coarser than an encoding that writes enc: above enc and a whole number of
-// the next unit of offsetUnits above enc (a second above a millisecond, a
-// millisecond above a microsecond, a minute above a second, an hour above a
-// minute), or above an enc no unit is above. Both runs' values cut to the
-// second and stored at the millisecond share a whole number of seconds;
-// two values the application does not cut share one by chance, one time in
-// about a million at a millisecond's or a microsecond's encoding and one in
-// 3,600 at a second's, and are refused the same. A Res above enc that is no
-// whole number of the next unit (half a second two millisecond values share
-// by chance, or 2 s two second values do) is none: the sums count it, and
-// the replay's value is read at its own resolution. A Res of enc itself
-// (an hour's time to live at a minute's encoding) is none either.
-func (o ClockOffset) CutCoarserThan(enc time.Duration) bool {
-	if o.Res <= enc {
-		return false
+// CheckedAt is the resolution Holds checks a replay's value of an offset
+// o at, a value whose own encoding writes res: o.Res where it is a step of
+// cutSteps coarser than res that CutOf would read as a cut at res (a unit,
+// a millisecond or finer, or a decimal step at least 1,000 times res: the
+// cut the learn step read in both of its values or their gap, or an
+// encoding coarser than the replay's), as standing for its whole cut,
+// whatever cut the value itself shows (one whose time to live is no whole
+// number of cuts shows a finer one, and its verdict must not turn on
+// that); res otherwise: a Res learned before cuts were (a granularity two
+// values shared by chance: 500 ms, 2 s, or 10 ms or 100 ms at a
+// millisecond's encoding) is read only in the sums.
+func (o ClockOffset) CheckedAt(res time.Duration) time.Duration {
+	if o.Res > res && CutOf(int64(o.Res), res, o.Res) == o.Res {
+		return o.Res
 	}
-	u := UnitAbove(enc)
-	return u == 0 || o.Res%u == 0
+	return res
 }
 
-// UnitAbove is the finest of the units an offset reads in (a day, an hour,
-// a minute, a second, a millisecond, a microsecond, a nanosecond) coarser
-// than enc, an encoding's resolution: a second above a millisecond, a minute
-// above a second. 0 above a day.
-func UnitAbove(enc time.Duration) time.Duration {
-	for i := len(offsetUnits) - 1; i >= 0; i-- {
-		if u := offsetUnits[i]; u > enc {
+// Checkable reports whether a replay can check a value of the offset o,
+// written at res, in a call's window from from to to (Holds): the window,
+// o's width and three of the coarser of the resolution it checks the value
+// at (CheckedAt) and o.Res are narrower than o's Unit (Within), so a time
+// to live changed by a unit cannot hold. A Plain o is always checkable.
+func (o ClockOffset) Checkable(res time.Duration, from, to time.Time) bool {
+	if o.Plain() {
+		return true
+	}
+	m := max(o.CheckedAt(res), o.Res)
+	return o.Within(to.Sub(from), o.Max-o.Min, m, m, m)
+}
+
+// cutSteps are the steps a Plain read's cut is read in, coarsest first:
+// the units an offset reads in (offsetUnits) and, between the units below a
+// second, the decimal steps a fraction's digits write (100 ms and 10 ms,
+// 100 µs and 10 µs, 100 ns and 10 ns): a database column of two fraction
+// digits cuts its value to 10 ms. Each is a whole number of the next finer
+// one.
+var cutSteps = []time.Duration{24 * time.Hour, time.Hour, time.Minute, time.Second, 100 * time.Millisecond, 10 * time.Millisecond, time.Millisecond, 100 * time.Microsecond, 10 * time.Microsecond, time.Microsecond, 100 * time.Nanosecond, 10 * time.Nanosecond, time.Nanosecond}
+
+// CutOf is the coarsest of cutSteps above enc and no coarser than upTo that
+// n, nanoseconds counted from the Unix epoch (or into a day), is a whole
+// multiple of: the cut a value written at enc shows, whose encoding cannot
+// show one at enc or finer. 0 where n shows none. A decimal step coarser
+// than a millisecond (10 ms, 100 ms) counts only where it is at least 1,000
+// times enc: a millisecond's value falls on a whole 10 ms one time in ten
+// by chance (on a whole 100 ms one in a hundred), and a step learned or
+// read by chance is a looser check (a value it holds may stand up to one
+// step stale: learn's CheckClockRead), so two values of a writer of
+// milliseconds would be learned at 10 ms about one slow recording in a
+// hundred. A unit (a second, a minute, an hour, a day) counts at any ratio:
+// applications cut to units, and two values of a writer of seconds both
+// fall on a whole minute only where record's full round read its clock
+// half a second or more off the recording's read (learn's FullRoundLead).
+// Steps nest, so a value a whole multiple of a step is one of every finer
+// step, and CutOf is the one cut all values that are whole multiples of it
+// share.
+func CutOf(n int64, enc, upTo time.Duration) time.Duration {
+	for _, u := range cutSteps {
+		if u > enc && u <= upTo && n%int64(u) == 0 && (u <= time.Millisecond || u >= time.Second || u >= 1000*enc) {
 			return u
 		}
 	}
@@ -414,19 +599,17 @@ func ceilTo(d, u time.Duration) time.Duration {
 }
 
 // Within reports whether spans, each at least zero, add up to less than o's
-// Unit. The learn step learns o only where its width and its resolution are
-// (o.Within(o.Max-o.Min, o.Res)), so it holds one multiple of its unit, the
-// one String names; Holds asks the same of the replay's window with them,
+// Unit. The learn step learns o only where its width and three of its
+// resolution do (o.Within(o.Max-o.Min, o.Res, o.Res, o.Res)), so it holds
+// one multiple of its unit, the one String names; Holds asks the same of
+// the replay's window with them, at the resolution it checks the value at,
 // so a time to live changed by a unit or more never holds, however the
-// replay's read falls in its window, as long as the application cuts its
-// value no coarser at the replay than in the two runs the learn step read,
-// and no coarser than Res there: a value cut to a whole number of the unit
-// above its encoding the learn step refuses (CutCoarserThan, and learn's
-// apartByUnits), but one cut finer than that unit (10 ms at a
-// millisecond's encoding) plus a time to live that is no whole number of
-// cuts stands up to a whole cut from its read, which Res does not count. A
-// time to live changed by less than that sum may hold, by where the read
-// falls.
+// replay's read falls in its window: a value checked at a cut c is held
+// from the start of the cut that holds the earliest read plus Min, less c,
+// up to the latest plus Max, plus c (holdsRead), up to the window, the
+// width and three cuts wide, and one whose time to live changed by a unit
+// lies outside that. A time to live changed by less than that sum may
+// hold, by where the read falls.
 func (o ClockOffset) Within(spans ...time.Duration) bool {
 	left := o.Unit()
 	for _, s := range spans {
@@ -438,35 +621,36 @@ func (o ClockOffset) Within(spans ...time.Duration) bool {
 	return true
 }
 
-// Holds reports whether at, a value cut to resolution res (truncated: it
-// stands for [at, at+res)), is a read of the clock made from from to to (a
-// call's window on the application's clock) plus an offset of o; of a Plain
-// o (a zero offset, a plain read of the clock), a read made there itself
-// (holdsRead). Of any other o: some read
-// t in [from, to] and offset d in [o.Min, o.Max) put t+d in [at, at+res),
-// so [from+o.Min, to+o.Max) and [at, at+res) meet. It reads at at res, the
-// replay's own resolution, never at o.Res, so a granularity the learn step
-// read in both runs' values accepts nothing more. It holds nothing where
-// the window, o's width and the coarser of res and o.Res add up to o's Unit
-// or more (Within): there a value whose time to live changed by a unit
-// could hold, by where the read fell, and the replay fails closed. Nor for
-// an o whose Unit is a second or finer: an application that cuts its value
-// to that unit makes a time to live changed by one look the same. Nor for
-// an o whose Res is a cut coarser than res's encoding (CutCoarserThan),
-// which the learn step never learns, or one it learned at an encoding
-// coarser than the replay's (a millisecond's Res at a nanosecond's
-// replay): the replay's value, read at res, would hold by where its read
-// fell in the cut. Nor for an o whose Zone a replay reads no value in
-// (ZoneKnown: ZoneApart, or one this keploy does not read). at is the
-// value's instant as read in o's Zone: the caller reads a wall clock of no
-// zone there (learn.CheckClockRead), and under ZoneEither in each of UTC and
-// the application's zone, passing the value where either holds. A window with no start (a zero to
-// is before any from), one that ends before it starts, a res of none or an
-// empty o (it has no Unit) holds nothing, and so does an o the learn step
-// never finds (a Min of zero or below, a Max not above Min, or a Res of
-// none or below: one built without the resolution it was learned at could
-// have its sums read finer than the application cuts its value), whose
-// width could overflow or whose Unit could swallow the sign of the offset.
+// Holds reports whether at, a value written at resolution res (its own
+// encoding's), is a read of the clock made from from to to (a call's window
+// on the application's clock) plus an offset of o; of a Plain o (a zero
+// offset, a plain read of the clock), a read made there itself (holdsRead).
+// Of any other o, a read of the clock plus an offset, then cut, is a clock
+// read (2026-10-28): at is checked as a plain read of the span from
+// from+o.Min to to+o.Max, at c, the cut o.Res where it is one coarser than
+// res (CheckedAt), else res: it holds within one c of that span on
+// either side (holdsRead: from the start of the c that holds from+o.Min,
+// less c, up to to+o.Max plus c), so a value a read in the window plus the
+// offset writes holds wherever the read fell in its cut, cut down or
+// rounded, and so does one up to one cut stale or ahead; one more than a
+// cut past either side never does, however the replay's read falls. It
+// holds nothing where the window, o's width and three of the coarser of c
+// and o.Res add up to o's Unit or more (Within): there a value whose time
+// to live changed by a unit could hold, and the replay fails closed. Nor
+// for an o whose Unit is a second or finer: an application that cuts its
+// value to that unit makes a time to live changed by one look the same.
+// Nor for an o whose Zone a replay reads no value in (ZoneKnown: ZoneApart,
+// or one this keploy does not read). at is the value's instant as read in
+// o's Zone: the caller reads a wall clock of no zone there
+// (learn.CheckClockRead), and under ZoneEither in each of UTC and the
+// application's zone, passing the value where either holds. A window with
+// no start (a zero to is before any from), one that ends before it starts,
+// a res of none or an empty o (it has no Unit) holds nothing, and so does an
+// o the learn step never finds (a Min of zero or below, a Max not above
+// Min, or a Res of none or below: one built without the resolution it was
+// learned at could have its sums read finer than the application cuts its
+// value), whose width could overflow or whose Unit could swallow the sign
+// of the offset.
 func (o ClockOffset) Holds(at time.Time, res time.Duration, from, to time.Time) bool {
 	if !o.ZoneKnown() || !o.LayoutKnown() {
 		return false
@@ -474,13 +658,14 @@ func (o ClockOffset) Holds(at time.Time, res time.Duration, from, to time.Time) 
 	if o.Plain() {
 		return o.holdsRead(at, res, from, to)
 	}
-	if o.Min <= 0 || o.Max <= o.Min || o.Res <= 0 || o.Unit() <= time.Second || from.IsZero() || to.Before(from) || res <= 0 || o.CutCoarserThan(res) {
+	if o.Min <= 0 || o.Max <= o.Min || o.Res <= 0 || o.Unit() <= time.Second || from.IsZero() || to.Before(from) || res <= 0 {
 		return false
 	}
-	if !o.Within(to.Sub(from), o.Max-o.Min, max(res, o.Res)) {
+	if !o.Checkable(res, from, to) {
 		return false
 	}
-	return from.Add(o.Min).Before(at.Add(res)) && at.Before(to.Add(o.Max))
+	c := o.CheckedAt(res)
+	return ClockOffset{Res: c}.holdsRead(at, c, from.Add(o.Min), to.Add(o.Max))
 }
 
 // Plain reports whether o is a zero offset: a plain read of the
@@ -493,8 +678,11 @@ func (o ClockOffset) Plain() bool { return o.Min == 0 && o.Max == 0 }
 // offsets both hold (from the later Min up to the earlier Max: a Plain o
 // holds the offset zero alone) at the coarser of their resolutions. Each
 // holds the true offset of a read its learn step saw, so the one place's
-// value holds it only where both do; a Res read coarser refuses more,
-// never less. Two that share no offset (a Plain and one with an offset, or
+// value holds it only where both do; a coarser Res is a cut (or an
+// encoding's resolution), at which a replay checks a value, of a Plain read
+// one that shows it, of an offset any (Holds), a read within one cut of its
+// span on either side (CheckClockRead in learn). Two that
+// share no offset (a Plain and one with an offset, or
 // two offsets apart), or that read it in zones no one zone holds (UTC and
 // the application's: ZoneApart, meetZones), meet as an Empty one, which
 // holds nothing; ZoneEither meets UTC or the application's zone as that
@@ -505,7 +693,21 @@ func (o ClockOffset) Plain() bool { return o.Min == 0 && o.Max == 0 }
 // recording paired many times keeps one answer whatever order its
 // pairings came in.
 func (o ClockOffset) Meet(p ClockOffset) ClockOffset {
-	return ClockOffset{Min: max(o.Min, p.Min), Max: min(o.Max, p.Max), Res: max(o.Res, p.Res), Zone: meetZones(o.Zone, p.Zone), Layout: meetLayouts(o.Layout, p.Layout)}
+	m := ClockOffset{Min: max(o.Min, p.Min), Max: min(o.Max, p.Max), Res: max(o.Res, p.Res), Zone: meetZones(o.Zone, p.Zone), Layout: meetLayouts(o.Layout, p.Layout), AppZone: o.AppZone}
+	switch {
+	case o.AppZone == "":
+		m.AppZone = p.AppZone
+	case p.AppZone != "" && p.AppZone != o.AppZone:
+		// Read in two named zones (recordings learned on two machines): no
+		// one zone holds both readings.
+		m.Zone, m.AppZone = ZoneApart, ""
+	}
+	if !m.AppZoneMatters() {
+		// A meet that reads no zone of the application's (a wall clock
+		// either zone held, met with one in UTC) names none.
+		m.AppZone = ""
+	}
+	return m
 }
 
 // Empty reports whether o is the Meet of learnings of one place that share
@@ -537,25 +739,158 @@ func MergeClocks(a, b map[string]ClockOffset) map[string]ClockOffset {
 	return out
 }
 
-// holdsRead is Holds of a Plain o: at, cut to resolution res (it stands for
-// [at, at+res)), is a read of the clock made from from to to, the call's
-// window on the application's clock, itself: some read t in [from, to] lies
-// in [at, at+res). A read the application made for the call lies in its
-// window whenever the replay ran, so a value the replay's own clock wrote
-// always holds and one moved by a resolution past the window never does:
-// the verdict does not turn on timing. It holds nothing for a res of none,
-// a window with no start or that ends before it starts, an o with no Res
-// (one built without the resolution it was learned at), or an o whose Res
-// is a cut coarser than res's encoding (CutCoarserThan: a value the
-// application cut to the second, stored at the millisecond, would hold only
-// where its read fell early enough in its second, by when the replay ran),
-// nor one learned at an encoding coarser than the replay's. There is no
-// unit to tell apart, so the window's width bounds nothing more.
+// holdsRead is Holds of a Plain o: at, a value written at resolution res
+// (its own encoding's, or a cut it shows: learn's CheckClockRead), lies
+// within one res of from to to, the call's window on the application's
+// clock, on either side (founder decision, 2026-10-27): from the start of
+// the res that holds from, less one res, up to to plus one res, both
+// included, read on the instant at writes, in the zone at carries (its
+// Location: the zone its res is read in, where a value cut to an hour or a
+// day shows that cut, ReadCut). A day is a day of that zone's calendar
+// (CutBefore, CutAfter): a day of 25 hours, when its clocks go back, is one
+// day, never 24 hours. So a value a read in the window writes holds
+// wherever the read fell in its res: cut down (Go's Truncate, a database
+// column of seconds) it lies at or after the start of the res that holds
+// from; rounded (JavaScript's Math.round(Date.now()/1000)) up to one res
+// after to. One stale by up to one res holds too (a timestamp cached for
+// under a second at a second's res, yesterday's date at a day's), and one
+// moved by more than one res past either side never does, however the
+// replay's read falls: the verdict does not turn on timing. It holds
+// nothing for a res of none, a window with no start or that ends before it
+// starts, an o with no Res (one built without the resolution it was learned
+// at), or an o whose Res is coarser than res: a cut the value does not
+// show, or one learned at an encoding coarser than the replay's. Learn's
+// CheckClockRead decides those first, by the cut the value itself shows,
+// and asks Holds of o read at the resolution it checks the value at. There
+// is no unit to tell apart, so the window's width bounds nothing more.
 func (o ClockOffset) holdsRead(at time.Time, res time.Duration, from, to time.Time) bool {
-	if o.Res <= 0 || res <= 0 || from.IsZero() || to.Before(from) || o.CutCoarserThan(res) {
+	if o.Res <= 0 || res <= 0 || from.IsZero() || to.Before(from) || o.Res > res {
 		return false
 	}
-	return from.Before(at.Add(res)) && !at.After(to)
+	loc := at.Location()
+	return !at.Before(CutBefore(ReadCut(from, res, loc), res, loc)) && !at.After(CutAfter(to, res, loc))
+}
+
+// ReadCut is the start of the cut of resolution res that holds t, read in
+// loc: for a day, the first instant of t's calendar day there (UnitStart:
+// 01:00 on a day whose clocks skip midnight); for an hour or a finer res,
+// t's wall clock in loc, at t's own offset, cut down to a whole res (zones'
+// offsets are whole minutes). In an hour the wall clock shows twice (the
+// clocks went back) that is the start of the showing t lies in, never the
+// first showing's, an hour or two earlier. Of res none, t.
+func ReadCut(t time.Time, res time.Duration, loc *time.Location) time.Time {
+	t = t.In(loc)
+	switch {
+	case res <= 0:
+		return t
+	case res >= 24*time.Hour:
+		return UnitStart(t, 24*time.Hour, loc)
+	}
+	r := WallNanos(t, loc) % int64(res)
+	if r < 0 {
+		r += int64(res)
+	}
+	return t.Add(-time.Duration(r))
+}
+
+// UnitStart is the first instant of t's hour (unit an hour) or calendar day
+// (a day) in loc: the instant its wall clock there turns to t's hour or
+// date, as Java's truncatedTo and atStartOfDay and JavaScript's
+// setHours(0) cut a time (Go's time.Date too in a zone ahead of UTC; behind
+// it, Go gives 23:00 the day before a skipped midnight): midnight, or, on a
+// day whose clocks skip midnight (Cairo, Santiago, Havana on the day summer
+// time starts), the first instant after the skipped hour. In an hour the
+// clocks show again more than an hour later (Troll's two-hour change), it
+// is the start of the showing t lies in.
+func UnitStart(t time.Time, unit time.Duration, loc *time.Location) time.Time {
+	l := t.In(loc)
+	y, m, d := l.Date()
+	h := 0
+	if unit < 24*time.Hour {
+		h = l.Hour()
+	}
+	same := func(x time.Time) bool {
+		xl := x.In(loc)
+		xy, xm, xd := xl.Date()
+		return xy == y && xm == m && xd == d && (unit >= 24*time.Hour || xl.Hour() == h)
+	}
+	s := time.Date(y, m, d, h, 0, 0, 0, loc)
+	if same(s) && !s.After(l) && !same(s.Add(-1)) {
+		return s
+	}
+	// The wall clock skipped the unit's start (time.Date then gives an
+	// instant outside it): the first instant at which it shows the unit,
+	// at most a day and a few hours before t.
+	lo, hi := l.Add(-unit-6*time.Hour), l
+	if s.Before(l) && !same(s) {
+		lo = s
+	}
+	for hi.Sub(lo) > 1 {
+		if mid := lo.Add(hi.Sub(lo) / 2); same(mid) {
+			hi = mid
+		} else {
+			lo = mid
+		}
+	}
+	return hi
+}
+
+// CutIn is the cut at's wall clock in loc shows (CutOf of WallNanos), or an
+// hour or a day where at is the first instant of its hour or calendar day
+// there (UnitStart), which the wall clock does not show where the zone's
+// clocks skipped its start: above enc and no coarser than upTo, as CutOf.
+func CutIn(at time.Time, loc *time.Location, enc, upTo time.Duration) time.Duration {
+	w := WallNanos(at, loc)
+	c := CutOf(w, enc, upTo)
+	if w%int64(time.Minute) != 0 {
+		return c
+	}
+	for _, u := range []time.Duration{24 * time.Hour, time.Hour} {
+		if u > c && u > enc && u <= upTo && at.Equal(UnitStart(at, u, loc)) {
+			return u
+		}
+	}
+	return c
+}
+
+// CutBefore is t one res earlier, read in loc: for a res of a day, the
+// first instant of the calendar day before t's there (t is a day's start:
+// ReadCut), a day of 25 or 23 hours one day; otherwise t less res.
+func CutBefore(t time.Time, res time.Duration, loc *time.Location) time.Time {
+	if res >= 24*time.Hour {
+		for n := res / (24 * time.Hour); n > 0; n-- {
+			t = UnitStart(UnitStart(t, 24*time.Hour, loc).Add(-1), 24*time.Hour, loc)
+		}
+		return t
+	}
+	return t.Add(-res)
+}
+
+// CutAfter is t one res later, read in loc: for a res of a day, the same
+// time of day on the next calendar day there (24 hours later, or 25 or
+// 23), and never before that day's first instant (where the next day's
+// clocks skip t's time of day); otherwise t plus res.
+func CutAfter(t time.Time, res time.Duration, loc *time.Location) time.Time {
+	if res >= 24*time.Hour {
+		next, start := t.In(loc), t
+		for n := res / (24 * time.Hour); n > 0; n-- {
+			next = next.AddDate(0, 0, 1)
+			start = UnitStart(UnitStart(start, 24*time.Hour, loc).Add(26*time.Hour), 24*time.Hour, loc)
+		}
+		if next.Before(start) {
+			return start
+		}
+		return next
+	}
+	return t.Add(res)
+}
+
+// WallNanos is t's wall clock in loc as nanoseconds from the Unix epoch
+// (t's instant plus loc's offset at it): a value cut to an hour or a day
+// in loc is a whole number of them there, whatever its offset from UTC.
+func WallNanos(t time.Time, loc *time.Location) int64 {
+	_, off := t.In(loc).Zone()
+	return t.UnixNano() + int64(off)*int64(time.Second)
 }
 
 // String is o as a person reads it: "clock" for a Plain o; "clock + 30m",
@@ -571,7 +906,7 @@ func (o ClockOffset) holdsRead(at time.Time, res time.Duration, from, to time.Ti
 func (o ClockOffset) String() string {
 	switch {
 	case o.Zone == ZoneApart:
-		return "clock reads in no one zone (one place learned as a wall clock of no zone in UTC, in the application's zone, or as a value that names its zone, at different calls)"
+		return "clock reads in no one zone (one place learned as a wall clock of no zone in UTC, in the application's zone, or as a value that names its zone, at different calls, or with the application's zone read as two different zones)"
 	case !o.ZoneKnown():
 		return "clock read in a zone this keploy does not read (" + strconv.Quote(o.Zone) + ")"
 	case o.Layout == LayoutApart:
@@ -579,7 +914,11 @@ func (o ClockOffset) String() string {
 	case !o.LayoutKnown():
 		return "clock read written in a layout this keploy does not read (" + strconv.Quote(o.Layout) + ")"
 	}
-	return o.offsetString() + o.zoneString() + o.layoutString()
+	s := o.offsetString() + o.zoneString() + o.layoutString()
+	if o.AppZone != "" {
+		s += ", read with the application's zone as " + o.AppZone
+	}
+	return s
 }
 
 // layoutString is the form o's Layout says a replay's value is written in,

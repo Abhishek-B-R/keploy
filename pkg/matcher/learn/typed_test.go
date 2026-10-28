@@ -2,8 +2,11 @@ package learn
 
 import (
 	"fmt"
+	"math/rand"
+	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -670,7 +673,10 @@ func TestATypedInstantLaterThanItsCallIsRefusedSayingSo(t *testing.T) {
 			if ln := ClassifyIn(clockedDrifts(), []string{p}, Shape{Leaves: map[string]Leaf{p: InstantLeaf(p, p, row.live, row.res)}}, Shape{Leaves: map[string]Leaf{p: InstantLeaf(p, p, row.rec, row.res)}}, call, nil, nil, answer, nil)[0]; ln.Kind != KindUnaccounted || len(ln.Echo) != 0 || ln.Why != instantPastCall {
 				t.Errorf("%s, no window, its answer echoes it: %s (echo %+v, %s); want refused: %s", row.name, ln.Kind, ln.Echo, ln.Why, instantPastCall)
 			}
-			w := &Window{Rec: Span{From: call.Add(-time.Hour), To: call.Add(-30 * time.Minute)}, F: Span{From: call.Add(-time.Hour), To: call.Add(-30 * time.Minute)}}
+			// Each run's window the two seconds before its call, F's the
+			// lead on: neither holds the call's minute, and no offset later
+			// than its call holds both values.
+			w := &Window{Rec: Span{From: call.Add(-2 * time.Second), To: call}, F: Span{From: call.Add(FullRoundLead - 2*time.Second), To: call.Add(FullRoundLead)}}
 			ln = ClassifyIn(clockedDrifts(), []string{p}, Shape{Leaves: map[string]Leaf{p: InstantLeaf(p, p, row.live, row.res)}}, Shape{Leaves: map[string]Leaf{p: InstantLeaf(p, p, row.rec, row.res)}}, call, nil, nil, nil, w)[0]
 			row.why = instantPastCall
 		}
@@ -807,7 +813,7 @@ func TestAClientTestsWindowReadsAWallClockOfNoZoneInTheApplicationsZone(t *testi
 	if ln := classifyZoned(ist, true, p, recJST, liveJST, call, w); ln.Kind != KindUnaccounted || ln.Why != clientTestWhy("", true) {
 		t.Errorf("read in JST within the window, the application's zone IST: %s (%s); want it refused: %s", ln.Kind, ln.Why, clientTestWhy("", true))
 	}
-	if !(&DriftCache{zone: ist, clientTests: true}).InstantClockRead(rec, live, w) || InstantClockRead(rec, live, w) {
+	if !clientDriftsIn(ist).InstantClockRead(rec, live, w) || InstantClockRead(rec, live, w) {
 		t.Errorf("InstantClockRead: the cache's reads the zone, the bare one UTC alone")
 	}
 }
@@ -824,7 +830,7 @@ func TestATimeOfDayIsAClockReadWhereTheLeadMovedIt(t *testing.T) {
 	call := time.Date(2026, 10, 22, 23, 59, 30, 155e6, time.UTC)
 	read := call.Add(-40 * time.Millisecond)
 	tod := func(at time.Time) Leaf { return TimeOfDayLeaf(p, p, time.Duration(clockOfDay(at)), time.Microsecond) }
-	if r, l := tod(read), tod(read.Add(FullRoundLead)); r.Value != "T23:59:30.115000" || l.Value != "T00:00:31.615000" {
+	if r, l := tod(read), tod(read.Add(FullRoundLead)); r.Value != "T23:59:30.115000" || l.Value != "T00:00:31.660000" {
 		t.Fatalf("the times as written: %q and %q", r.Value, l.Value)
 	}
 	if ln := classifyZoned(nil, false, p, tod(read), tod(read.Add(FullRoundLead+37*time.Millisecond)), call, nil); !todRead(ln, models.ZoneUTC) || ln.Read.Layout != models.LayoutTypedTimeOfDay {
@@ -999,7 +1005,7 @@ func TestAnInstantThatNamesItsMomentIsReadInUTCAloneInItsWindow(t *testing.T) {
 			t.Errorf("client test %v: the clock plus 5h30m as an instant naming its moment, the application's zone IST: %s (%s); want it refused", client, ln.Kind, ln.Why)
 		}
 	}
-	if (&DriftCache{zone: ist, clientTests: true}).InstantClockRead(rec, live, w) {
+	if clientDriftsIn(ist).InstantClockRead(rec, live, w) {
 		t.Errorf("DriftCache.InstantClockRead reads an instant that names its moment in the application's zone")
 	}
 }
@@ -1207,8 +1213,8 @@ func TestATimeOfDayInTheOtherFormIsTheSameMoment(t *testing.T) {
 
 // clockOffsetCall is a call recorded at call whose application set an expiry
 // thirty minutes after a read of its clock 40 ms before it, the previous
-// call 50 ms before; record's full round made it FullRoundLead and 37 ms on,
-// its read 45 ms before it, its previous call 60 ms before.
+// call 50 ms before; record's full round made it 61.537 s on (FullRoundLead
+// less 8 ms), its read 45 ms before it, its previous call 60 ms before.
 type clockOffsetCall struct {
 	call, read, fcall, fread time.Time
 	w                        *Window
@@ -1216,7 +1222,7 @@ type clockOffsetCall struct {
 
 func newClockOffsetCall() clockOffsetCall {
 	call := time.Date(2026, 10, 26, 11, 14, 17, 155e6, time.UTC)
-	fcall := call.Add(FullRoundLead + 37*time.Millisecond)
+	fcall := call.Add(FullRoundLead - 8*time.Millisecond)
 	return clockOffsetCall{
 		call: call, read: call.Add(-40 * time.Millisecond),
 		fcall: fcall, fread: fcall.Add(-45 * time.Millisecond),
@@ -1292,11 +1298,10 @@ func TestAnInstantAtTheClockPlusAnOffsetIsLearnedAsThatOffset(t *testing.T) {
 		t.Errorf("a minute's expiry: %s %+v (%s); want refused: %s", ln.Kind, ln.Offset, ln.Why, clockOffsetWideWhy(p, minute, min))
 	}
 	// An hour's expiry at a minute's resolution reads in hours: learned,
-	// from 59m42.845s up to 1h0m41.368s, at the minute its encoding writes,
-	// which is no cut the application made (models.ClockOffset.CutCoarserThan).
+	// from 59m42.845s up to 1h0m41.368s, at the minute its encoding writes.
 	// A replay at a minute's encoding holds an hour, never two or none; one
-	// whose value is written at the millisecond holds nothing, as a minute
-	// is a cut coarser than that.
+	// whose value is written at the millisecond is checked at the minute
+	// (models.ClockOffset.CheckedAt), as standing for its whole minute.
 	ln = c.classify(p, c.read.Add(time.Hour).Truncate(min), c.fread.Add(time.Hour).Truncate(min), min, c.w.ComparesOffsets())
 	hour := models.ClockOffset{Min: time.Hour - 17155*ms, Max: time.Hour + 41368*ms, Res: min, Layout: models.LayoutTyped}
 	if ln.Kind != KindClockOffset || ln.Offset == nil || *ln.Offset != hour || ln.Offset.Unit() != time.Hour || !strings.HasPrefix(ln.Why, p+" = clock + 1h (") || !strings.Contains(ln.Why, "a time to live changed by an hour or more still fails") {
@@ -1313,8 +1318,8 @@ func TestAnInstantAtTheClockPlusAnOffsetIsLearnedAsThatOffset(t *testing.T) {
 				t.Errorf("%s: an hour at a minute's encoding, a replay's read %s into its minute plus %s: holds %v, want %v", map[bool]string{true: "FALSE RED", false: "FALSE GREEN"}[row.want], read.Sub(read.Truncate(min)), row.ttl, got, row.want)
 			}
 		}
-		if ln.Offset.Holds(read.Add(time.Hour).Truncate(ms), ms, from, to) {
-			t.Errorf("an hour learned at a minute's encoding held a replay's value at the millisecond; want nothing held")
+		if !ln.Offset.Holds(read.Add(time.Hour).Truncate(ms), ms, from, to) || ln.Offset.Holds(read.Add(time.Hour+3*time.Minute).Truncate(ms), ms, from, to) {
+			t.Errorf("an hour learned at a minute's encoding, a replay's value at the millisecond: want the read plus an hour held at the minute, and three minutes more not")
 		}
 	}
 }
@@ -1361,12 +1366,11 @@ func TestAClockOffsetIsBoundedByBothRunsWindows(t *testing.T) {
 	// F's window 10 ms wide, its read 5 ms before its call: from 29m59.995s
 	// up to 30m0.006s, inside the recording's. The two values (…17.115 and
 	// …18.687, counted in milliseconds from the epoch) both happen to be
-	// whole multiples of 3 ms, so the sums read the value at 3 ms (Res), not
-	// its encoding's 1 ms: they refuse more, and the bound stays the
-	// encoding's.
+	// whole multiples of 3 ms, which is no step (offsetCut): learned at the
+	// millisecond its encoding writes.
 	narrow := &Window{Rec: c.w.Rec, F: Span{From: c.fcall.Add(-10 * ms), To: c.fcall}}
 	ln := c.classify(p, rec, c.fcall.Add(30*time.Minute-5*ms), ms, narrow.ComparesOffsets())
-	if want := (models.ClockOffset{Min: 30*time.Minute - 5*ms, Max: 30*time.Minute + 6*ms, Res: 3 * ms, Layout: models.LayoutTyped}); ln.Kind != KindClockOffset || ln.Offset == nil || *ln.Offset != want {
+	if want := (models.ClockOffset{Min: 30*time.Minute - 5*ms, Max: 30*time.Minute + 6*ms, Res: ms, Layout: models.LayoutTyped}); ln.Kind != KindClockOffset || ln.Offset == nil || *ln.Offset != want {
 		t.Errorf("F's narrower window: %s %+v (%s); want the offset %+v", ln.Kind, ln.Offset, ln.Why, want)
 	}
 	// F's least offset is the recording's bound, 30m0.011s: they touch.
@@ -1552,91 +1556,95 @@ func TestATimeToLiveChangedAfterLearningStillFails(t *testing.T) {
 	}
 }
 
-// B1 of the offset rule's second review: an application that cuts its value
-// coarser than its encoding writes (Go's Truncate(time.Second), stored as a
-// millisecond $date) shows that cut in both runs' values, and the sums that
-// decide whether a replay can compare its offset read it there
-// (models.ClockOffset.Res); the bounds, and a replay's value, stay at the
-// encoding's resolution, so the cut only ever refuses more. Thirty minutes
-// cut to the second is refused where the second does not turn inside its
-// call's windows (no one offset at the millisecond), and where it turns
-// inside both: a cut of a whole number of seconds at a millisecond's
-// encoding (models.ClockOffset.CutCoarserThan) is never learned, since a
-// replay reading its value at the millisecond would pass or fail by where
-// its read fell in its second; nothing holds such an offset. Two values
-// that share half a second by chance are learned, the grain only in the
-// sums, the replay's value read at its own millisecond. Forty-five or
-// ninety seconds cut to the second reads in seconds: refused, since a cut
-// to the unit makes a time to live changed by one look the same. Thirty
-// minutes cut to the minute is refused (no one offset, or too wide where
-// the minute turns inside both windows, the reason naming the cut), so no
-// replay holds thirty-one minutes read late in its minute; an hour cut to
-// the minute is refused as a cut, at a millisecond's encoding and at a
-// second's. A millisecond cut at a microsecond's encoding is refused the
-// same, and two second values that share 2 s by chance are learned. A
-// value a millisecond after its call (a plain read made after the call's
-// first byte, N2) reads in milliseconds: refused.
-func TestAValueCutCoarserThanItsEncodingIsRefusedAsACut(t *testing.T) {
+// A clock read plus a constant offset, then cut, is a clock read
+// (2026-10-28): an application that cuts its value coarser than its
+// encoding writes (Go's Truncate(time.Second), stored as a millisecond
+// $date) is learned at the cut its values show (offsetCut, Res), its
+// offset bounded at it, and a replay checks its value at the cut, within
+// one cut of the span plus the offset on either side, never refused for
+// the cut. Thirty minutes cut to the second is learned whether the second
+// turns inside its call's windows or not, in either order of the bounds;
+// at a replay an hour on it holds at every read position in a second, and
+// thirty-one, twenty-nine minutes and an hour never do. Two values that
+// share half a second by chance share no step: learned at the millisecond.
+// Forty-five or ninety seconds cut to the second reads in seconds:
+// refused, since a cut to the unit makes a time to live changed by one
+// look the same. Thirty minutes cut to the minute is refused as too wide
+// (three minutes and its width are no narrower than the minute it reads
+// in), so no replay holds thirty-one minutes; an hour cut to the minute is
+// learned, at a millisecond's encoding and at a second's, and checked at
+// the minute. A millisecond cut at a microsecond's encoding is learned at
+// the millisecond, and two second values that share 2 s by chance at the
+// second. A minute cut plus a time to live that is no whole number of
+// minutes (its values a whole minute apart, neither a whole minute) is
+// read at the minute: refused as too wide. Two uncut millisecond values a
+// whole number of seconds apart by chance are learned at the second. A
+// value a millisecond after its call reads in milliseconds: refused.
+func TestAnOffsetCutCoarserThanItsEncodingIsCheckedAtTheCut(t *testing.T) {
 	const p = "body.expiresAt"
 	c := newClockOffsetCall()
 	ms, sec := time.Millisecond, time.Second
 	w := c.w.ComparesOffsets()
 
 	// The recording's value 11:44:17, its window from 11:14:17.105 to
-	// 11:14:17.155: from 29m59.845s up to 29m59.896s at the millisecond;
-	// F's 11:45:18: from 29m59.308s up to 29m59.369s. No one offset.
-	if ln := c.classify(p, c.read.Truncate(sec).Add(30*time.Minute), c.fread.Truncate(sec).Add(30*time.Minute), ms, w); ln.Kind != KindUnaccounted || ln.Offset != nil || ln.Why != instantAfterCall {
-		t.Errorf("thirty minutes cut to the second, the second outside the windows: %s %+v (%s); want refused as before", ln.Kind, ln.Offset, ln.Why)
+	// 11:14:17.155: from 29m59.845s up to 30m0.895s at the second; F's
+	// 11:45:18, its window from 11:15:18.632 to 11:15:18.692: from
+	// 29m59.308s up to 30m0.368s.
+	out := models.ClockOffset{Min: 30*time.Minute - 155*ms, Max: 30*time.Minute + 368*ms, Res: sec, Layout: models.LayoutTyped}
+	if ln := c.classify(p, c.read.Truncate(sec).Add(30*time.Minute), c.fread.Truncate(sec).Add(30*time.Minute), ms, w); ln.Kind != KindClockOffset || ln.Offset == nil || *ln.Offset != out || ln.Why != clockOffsetEvidence(p, out) {
+		t.Errorf("FALSE RED: thirty minutes cut to the second, the second outside the windows: %s %+v (%s); want the offset %+v", ln.Kind, ln.Offset, ln.Why, out)
 	}
 	// Windows the second turns in: the recording's from 11:14:16.980, its
 	// read at 11:14:17.010; F's from 11:15:17.992, its read at 11:15:18.010.
-	// From 29m59.845s up to 30m0.021s, and from 29m59.308s up to 30m0.009s:
-	// one offset, but both values are whole seconds, a cut coarser than the
-	// millisecond their encoding writes: refused, the reason naming the cut.
+	// From 29m59.845s up to 30m1.02s, and from 29m59.308s up to 30m1.008s.
 	turn := (&Window{Rec: Span{From: c.call.Add(-175 * ms), To: c.call}, F: Span{From: c.fcall.Add(-700 * ms), To: c.fcall}}).ComparesOffsets()
 	rec, live := c.call.Add(-145*ms).Truncate(sec).Add(30*time.Minute), c.fcall.Add(-682*ms).Truncate(sec).Add(30*time.Minute)
+	want := models.ClockOffset{Min: 30*time.Minute - 155*ms, Max: 30*time.Minute + 1008*ms, Res: sec, Layout: models.LayoutTyped}
 	ln := c.classify(p, rec, live, ms, turn)
-	want := models.ClockOffset{Min: 30*time.Minute - 155*ms, Max: 30*time.Minute + 9*ms, Res: sec, Layout: models.LayoutTyped}
-	if cut := clockOffsetCutWhy(p, want, ms); ln.Kind != KindUnaccounted || ln.Offset != nil || ln.Why != cut || !strings.HasPrefix(ln.Why, p+" = clock + 30m (from 29m59.845s to 30m0.009s): ") || !strings.Contains(ln.Why, "but both runs' values are whole multiples of 1s, coarser than the 1ms their encoding writes: the application cuts its value") {
-		t.Errorf("FALSE GREEN? thirty minutes cut to the second, the second inside both windows: %s %+v (%s); want refused: %s", ln.Kind, ln.Offset, ln.Why, cut)
+	if ln.Kind != KindClockOffset || ln.Offset == nil || *ln.Offset != want || !strings.HasPrefix(ln.Why, p+" = clock + 30m (from 29m59.845s to 30m1.008s): ") {
+		t.Errorf("FALSE RED: thirty minutes cut to the second, the second inside both windows: %s %+v (%s); want the offset %+v", ln.Kind, ln.Offset, ln.Why, want)
 	}
 	// The same windows the other way round, the recording's bound the
-	// lesser: the recording's from 11:14:16.992 to 11:14:17.692, its read at
-	// 11:14:17.010, from 29m59.308s up to 30m0.009s; F's from 11:15:17.980
-	// to 11:15:18.155, its read at 11:15:18.010, from 29m59.845s up to
-	// 30m0.021s. The same offset: the cut both values share bounds neither
-	// run's offsets, only the sums.
+	// lesser: the same offset.
 	mirror := clockOffsetCall{call: c.call.Add(537 * ms), fcall: c.fcall.Add(-537 * ms)}
 	mirror.w = (&Window{Rec: Span{From: mirror.call.Add(-700 * ms), To: mirror.call}, F: Span{From: mirror.fcall.Add(-175 * ms), To: mirror.fcall}}).ComparesOffsets()
-	if ln := mirror.classify(p, mirror.call.Add(-682*ms).Truncate(sec).Add(30*time.Minute), mirror.fcall.Add(-145*ms).Truncate(sec).Add(30*time.Minute), ms, mirror.w); ln.Kind != KindUnaccounted || ln.Offset != nil || ln.Why != clockOffsetCutWhy(p, want, ms) {
-		t.Errorf("FALSE GREEN? thirty minutes cut to the second, the recording's bound the lesser: %s %+v (%s); want refused: %s", ln.Kind, ln.Offset, ln.Why, clockOffsetCutWhy(p, want, ms))
+	if ln := mirror.classify(p, mirror.call.Add(-682*ms).Truncate(sec).Add(30*time.Minute), mirror.fcall.Add(-145*ms).Truncate(sec).Add(30*time.Minute), ms, mirror.w); ln.Kind != KindClockOffset || ln.Offset == nil || *ln.Offset != want {
+		t.Errorf("FALSE RED: thirty minutes cut to the second, the recording's bound the lesser: %s %+v (%s); want the offset %+v", ln.Kind, ln.Offset, ln.Why, want)
 	}
-	// Nor does such an offset hold at a replay an hour on, its window 50 ms
-	// wide, its read 20 ms into it, the window started at each 10 ms of a
-	// second, its value cut to the second too.
+	// A replay an hour on, its window 50 ms wide, its read 20 ms into it,
+	// the window started at each 10 ms of a second, its value cut to the
+	// second too: thirty minutes holds at every one (no verdict turns on
+	// when the replay ran), cut down or rounded; the others never do.
 	base := c.call.Add(time.Hour).Truncate(sec)
 	for step := time.Duration(0); step < sec; step += 10 * ms {
 		from := base.Add(step)
 		to, read := from.Add(50*ms), from.Add(20*ms)
-		for _, ttl := range []time.Duration{30 * time.Minute, 31 * time.Minute, 29 * time.Minute, time.Hour} {
-			if want.Holds(read.Truncate(sec).Add(ttl), ms, from, to) {
-				t.Errorf("an offset at a second's cut: a replay's read %s into its second, cut to it, plus %s held; want nothing held", read.Sub(read.Truncate(sec)), ttl)
+		for _, row := range []struct {
+			at   time.Time
+			want bool
+		}{
+			{read.Add(30 * time.Minute).Truncate(sec), true}, {read.Add(30 * time.Minute).Round(sec), true},
+			{read.Add(31 * time.Minute).Truncate(sec), false}, {read.Add(29 * time.Minute).Truncate(sec), false}, {read.Add(time.Hour).Truncate(sec), false},
+		} {
+			if got, _ := CheckClockRead(p, want, InstantLeaf(p, p, row.at, ms), Span{From: from, To: to}, true); got != row.want {
+				t.Errorf("%s: an offset at a second's cut, a replay's read %s into its second, its value %s after it: holds %v, want %v", map[bool]string{true: "FALSE RED", false: "FALSE GREEN"}[row.want], read.Sub(read.Truncate(sec)), row.at.Sub(read), got, row.want)
 			}
 		}
 	}
+	// A value moved by more than one cut past the widened span is refused,
+	// the reason naming the cut it was checked at.
+	from := base.Add(500 * ms)
+	moved := from.Add(50 * ms).Add(want.Max).Add(sec + ms)
+	if ok, why := CheckClockRead(p, want, InstantLeaf(p, p, moved, ms), Span{From: from, To: from.Add(50 * ms)}, true); ok || !strings.Contains(why, "made in this call's window: it changed (checked as standing for the whole 1s the learn step read it cut to)") {
+		t.Errorf("FALSE GREEN? a value a second and a millisecond past the widened span: %v (%s); want refused naming the cut", ok, why)
+	}
 
 	// Two values that share half a second by chance (an application that
-	// does not cut them: its reads fell on 17.5 s and 19.0 s, 61.5 s apart,
-	// no whole number of seconds): learned, the grain only in the sums. The
-	// recording's window from 11:14:17.480 to 11:14:17.530, from 29m59.97s
-	// up to 30m0.021s; F's from 11:15:18.950 to 11:15:19.010, from 29m59.99s
-	// up to 30m0.051s: the recording's bound is the lesser. Then the other
-	// way round, F's from 11:15:18.990 to 11:15:19.020 and the recording's
-	// from 11:14:17.470 to 11:14:17.520:
-	// from 29m59.98s up to 30m0.031s, and up to 30m0.011s, F's the lesser.
-	// A replay reads its value at its own millisecond: the read plus thirty
-	// minutes holds, a value 400 ms earlier (inside the shared half second)
-	// does not.
+	// does not cut them: its reads fell on 17.5 s and 19.0 s, 61.5 s apart):
+	// half a second is no step, so they show no cut: learned at the
+	// millisecond, the bounds as before. A replay reads its value at its
+	// own millisecond: the read plus thirty minutes holds, a value 400 ms
+	// earlier does not.
 	half := time.Date(2026, 10, 26, 11, 14, 17, 500e6, time.UTC)
 	hrec, hlive := half.Add(30*time.Minute), half.Add(61500*ms+30*time.Minute)
 	if g := sharedGrain(hrec, hlive); g != 500*ms {
@@ -1647,8 +1655,8 @@ func TestAValueCutCoarserThanItsEncodingIsRefusedAsACut(t *testing.T) {
 		w    *Window
 		want models.ClockOffset
 	}{
-		{"the recording's bound the lesser", &Window{Rec: Span{From: half.Add(-20 * ms), To: half.Add(30 * ms)}, F: Span{From: half.Add(61500*ms - 50*ms), To: half.Add(61500*ms + 10*ms)}}, models.ClockOffset{Min: 30*time.Minute - 10*ms, Max: 30*time.Minute + 21*ms, Res: 500 * ms, Layout: models.LayoutTyped}},
-		{"F's bound the lesser", &Window{Rec: Span{From: half.Add(-30 * ms), To: half.Add(20 * ms)}, F: Span{From: half.Add(61500*ms - 10*ms), To: half.Add(61500*ms + 20*ms)}}, models.ClockOffset{Min: 30*time.Minute - 20*ms, Max: 30*time.Minute + 11*ms, Res: 500 * ms, Layout: models.LayoutTyped}},
+		{"the recording's bound the lesser", &Window{Rec: Span{From: half.Add(-20 * ms), To: half.Add(30 * ms)}, F: Span{From: half.Add(61500*ms - 50*ms), To: half.Add(61500*ms + 10*ms)}}, models.ClockOffset{Min: 30*time.Minute - 10*ms, Max: 30*time.Minute + 21*ms, Res: ms, Layout: models.LayoutTyped}},
+		{"F's bound the lesser", &Window{Rec: Span{From: half.Add(-30 * ms), To: half.Add(20 * ms)}, F: Span{From: half.Add(61500*ms - 10*ms), To: half.Add(61500*ms + 20*ms)}}, models.ClockOffset{Min: 30*time.Minute - 20*ms, Max: 30*time.Minute + 11*ms, Res: ms, Layout: models.LayoutTyped}},
 	} {
 		hc := clockOffsetCall{call: row.w.Rec.To, fcall: row.w.F.To}
 		ln := hc.classify(p, hrec, hlive, ms, row.w.ComparesOffsets())
@@ -1665,7 +1673,7 @@ func TestAValueCutCoarserThanItsEncodingIsRefusedAsACut(t *testing.T) {
 
 	// Cut to the second, a time to live of forty-five or ninety seconds
 	// reads in seconds: refused, naming it, where one offset shows; refused
-	// as before where none does.
+	// where none does.
 	for _, ttl := range []time.Duration{45 * sec, 90 * sec} {
 		ln := c.classify(p, c.call.Add(-145*ms).Truncate(sec).Add(ttl), c.fcall.Add(-682*ms).Truncate(sec).Add(ttl), ms, turn)
 		if ln.Kind != KindUnaccounted || ln.Offset != nil || !strings.Contains(ln.Why, "but the offset reads in seconds, and an application that cuts its value to the second makes a time to live changed by a second look the same, so keploy refuses an offset that reads in a second or finer") {
@@ -1686,87 +1694,110 @@ func TestAValueCutCoarserThanItsEncodingIsRefusedAsACut(t *testing.T) {
 			t.Errorf("FALSE GREEN? thirty minutes cut to the minute, stored at the millisecond: %s %+v (%s); want refused", ln.Kind, ln.Offset, ln.Why)
 		}
 	}
-
 	// Windows the minute turns in: the recording's call at 11:15:00.020,
 	// its window from 11:14:59.900, its read at 11:15:00.005; F's call at
-	// 11:16:00.070, from 11:15:59.950, its read at 11:16:00.010. One offset,
-	// from 29m59.98s up to 30m0.051s at the millisecond, but both values
-	// are whole minutes, so the sums read it at a minute, which is no
-	// narrower than the minute it reads in: refused, the reason saying the
+	// 11:16:00.070, from 11:15:59.950, its read at 11:16:00.010. Bounded at
+	// the minute both values show, from 29m59.98s up to 31m0.05s: no
+	// narrower than the minute it reads in, refused, the reason saying the
 	// values' cut set the resolution, not their encoding.
 	minute := clockOffsetCall{call: time.Date(2026, 10, 26, 11, 15, 0, 20e6, time.UTC), fcall: time.Date(2026, 10, 26, 11, 16, 0, 70e6, time.UTC)}
 	minute.w = (&Window{Rec: Span{From: minute.call.Add(-120 * ms), To: minute.call}, F: Span{From: minute.fcall.Add(-120 * ms), To: minute.fcall}}).ComparesOffsets()
 	ln = minute.classify(p, minute.call.Add(-15*ms).Truncate(time.Minute).Add(30*time.Minute), minute.fcall.Add(-60*ms).Truncate(time.Minute).Add(30*time.Minute), ms, minute.w)
-	if want := p + " = clock plus an offset from 29m59.98s to 30m0.051s at a resolution of 1m (both runs' values are whole multiples of it, coarser than the 1ms their encoding writes): "; ln.Kind != KindUnaccounted || ln.Offset != nil || !strings.HasPrefix(ln.Why, want) || !strings.Contains(ln.Why, "are not narrower than the minute the offset reads in") {
+	if want := p + " = clock plus an offset from 29m59.98s to 31m0.05s at a resolution of 1m (the cut both runs' values show, coarser than the 1ms their encoding writes): "; ln.Kind != KindUnaccounted || ln.Offset != nil || !strings.HasPrefix(ln.Why, want) || !strings.Contains(ln.Why, "not narrower than the minute the offset reads in") {
 		t.Errorf("FALSE GREEN? thirty minutes cut to the minute, the minute inside both windows: %s %+v (%s); want refused with the reason %q...", ln.Kind, ln.Offset, ln.Why, want)
 	}
 
-	// An hour cut to the minute, in the windows the minute turns in: from
-	// 59m59.98s up to 1h0m0.051s at the millisecond (1h0m1.05s at the
-	// second), one offset in hours, narrow enough, but both values are whole
-	// minutes: refused as a cut at a millisecond's encoding and at a
-	// second's, where a minute is the unit above it.
+	// An hour cut to the minute, in the same windows: from 59m59.98s up to
+	// 1h1m0.05s, one offset in hours, narrow enough with three minutes:
+	// learned at a millisecond's encoding and at a second's, and checked at
+	// the minute at every read position in a minute.
+	hour := models.ClockOffset{Min: time.Hour - 20*ms, Max: time.Hour + time.Minute + 50*ms, Res: time.Minute, Layout: models.LayoutTyped}
 	for _, enc := range []time.Duration{ms, sec} {
 		ln = minute.classify(p, minute.call.Add(-15*ms).Truncate(time.Minute).Add(time.Hour), minute.fcall.Add(-60*ms).Truncate(time.Minute).Add(time.Hour), enc, minute.w)
-		if want := ", but both runs' values are whole multiples of 1m, coarser than the " + models.ShortDuration(enc) + " their encoding writes: the application cuts its value"; ln.Kind != KindUnaccounted || ln.Offset != nil || !strings.HasPrefix(ln.Why, p+" = clock + 1h (") || !strings.Contains(ln.Why, want) {
-			t.Errorf("FALSE GREEN? an hour cut to the minute, stored at %s: %s %+v (%s); want refused naming the cut: %q", enc, ln.Kind, ln.Offset, ln.Why, want)
+		if ln.Kind != KindClockOffset || ln.Offset == nil || *ln.Offset != hour {
+			t.Errorf("FALSE RED: an hour cut to the minute, stored at %s: %s %+v (%s); want the offset %+v", enc, ln.Kind, ln.Offset, ln.Why, hour)
+		}
+	}
+	for step := time.Duration(0); step < time.Minute; step += 250 * ms {
+		from := minute.call.Add(3 * time.Hour).Truncate(time.Minute).Add(step)
+		to, read := from.Add(50*ms), from.Add(20*ms)
+		for _, row := range []struct {
+			ttl  time.Duration
+			want bool
+		}{{time.Hour, true}, {2 * time.Hour, false}, {time.Hour + 3*time.Minute, false}, {time.Hour - 3*time.Minute, false}} {
+			if got := hour.Holds(read.Add(row.ttl).Truncate(time.Minute), ms, from, to); got != row.want {
+				t.Errorf("%s: an hour cut to the minute, a replay's read %s into its minute plus %s: holds %v, want %v", map[bool]string{true: "FALSE RED", false: "FALSE GREEN"}[row.want], read.Sub(read.Truncate(time.Minute)), row.ttl, got, row.want)
+			}
 		}
 	}
 	// A millisecond cut at a microsecond's encoding (a JavaScript Date in a
-	// Postgres timestamp): refused as a cut.
-	if ln := c.classify(p, c.read.Add(30*time.Minute).Truncate(ms), c.fread.Add(30*time.Minute).Truncate(ms), time.Microsecond, w); ln.Kind != KindUnaccounted || ln.Offset != nil || !strings.HasPrefix(ln.Why, p+" = clock + 30m (") || !strings.Contains(ln.Why, ", coarser than the 1µs their encoding writes: the application cuts its value") {
-		t.Errorf("FALSE GREEN? thirty minutes cut to the millisecond, stored at the microsecond: %s %+v (%s); want refused as a cut", ln.Kind, ln.Offset, ln.Why)
+	// Postgres timestamp): learned at the millisecond.
+	msCut := models.ClockOffset{Min: 30*time.Minute - 40*ms, Max: 30*time.Minute + 11*ms, Res: ms, Layout: models.LayoutTyped}
+	if ln := c.classify(p, c.read.Add(30*time.Minute).Truncate(ms), c.fread.Add(30*time.Minute).Truncate(ms), time.Microsecond, w); ln.Kind != KindClockOffset || ln.Offset == nil || *ln.Offset != msCut {
+		t.Errorf("FALSE RED: thirty minutes cut to the millisecond, stored at the microsecond: %s %+v (%s); want the offset %+v", ln.Kind, ln.Offset, ln.Why, msCut)
 	}
 	// Two values at a second's encoding that share 2 s by chance: 2 s is no
-	// whole number of minutes, the unit above a second, so no cut: learned,
-	// Res 2 s. The recording's read at 11:14:58.100, its window from
-	// 11:14:58.090 to 11:14:58.140; F's at 11:16:00.000, from 11:15:59.990
-	// to 11:16:00.040: from 29m59.86s up to 30m0.91s, and from 29m59.96s up
-	// to 30m1.01s.
+	// step, so learned at the second. The recording's read at 11:14:58.100,
+	// its window from 11:14:58.090 to 11:14:58.140; F's at 11:16:00.000,
+	// from 11:15:59.990 to 11:16:00.040: from 29m59.86s up to 30m0.91s, and
+	// from 29m59.96s up to 30m1.01s.
 	two := clockOffsetCall{call: time.Date(2026, 10, 26, 11, 14, 58, 140e6, time.UTC), fcall: time.Date(2026, 10, 26, 11, 16, 0, 40e6, time.UTC)}
 	two.w = (&Window{Rec: Span{From: two.call.Add(-50 * ms), To: two.call}, F: Span{From: two.fcall.Add(-50 * ms), To: two.fcall}}).ComparesOffsets()
 	trec, tlive := two.call.Add(-40*ms).Add(30*time.Minute).Truncate(sec), two.fcall.Add(-40*ms).Add(30*time.Minute).Truncate(sec)
 	if g := sharedGrain(trec, tlive); g != 2*sec {
 		t.Fatalf("precondition: the two second values share %s, want 2s", g)
 	}
-	twoWant := models.ClockOffset{Min: 30*time.Minute - 40*ms, Max: 30*time.Minute + 910*ms, Res: 2 * sec, Layout: models.LayoutTyped}
+	twoWant := models.ClockOffset{Min: 30*time.Minute - 40*ms, Max: 30*time.Minute + 910*ms, Res: sec, Layout: models.LayoutTyped}
 	if ln := two.classify(p, trec, tlive, sec, two.w); ln.Kind != KindClockOffset || ln.Offset == nil || *ln.Offset != twoWant {
 		t.Errorf("2 s shared by chance at a second's encoding: %s %+v (%s); want the offset %+v", ln.Kind, ln.Offset, ln.Why, twoWant)
 	}
 
 	// B1 of the offset rule's third review: a minute cut plus a time to
 	// live that is no whole number of minutes, at a second's encoding (a
-	// BSON timestamp), its windows about half a minute wide. The
-	// recording's read at 11:14:58.500, its window from 28 s before it to
-	// 0.6 s after; F's 61 s later, from 29 s before it to 0.6 s after. Plus
-	// 30m30s, the two values share 30 s and show one offset, from 29m30.9s
-	// up to 30m0.5s; learned, a replay with a time to live of 29m30s held
-	// where its read fell early in its minute, and 30m30s did not. Plus
-	// 30m17s (the reads at 11:14:17.500 and 61 s on), they share only the
-	// second their encoding writes, from 29m58.9s up to 30m28.5s. Both stand
-	// a whole minute apart, the unit above a second: refused, naming it.
+	// BSON timestamp), its windows about half a minute wide. Plus 30m30s
+	// the two values share 30 s, plus 30m17s only the second, and both
+	// stand a whole minute apart: one offset at the second holds both runs
+	// (from 29m30.9s up to 30m0.5s, and from 29m58.9s up to 30m28.5s), and
+	// one at the minute too, so keploy cannot tell at which cut a replay
+	// must check them: refused, naming both (offsetReading).
 	for _, row := range []struct {
 		ttl  time.Duration
 		read time.Time
 		want models.ClockOffset
 	}{
-		{30*time.Minute + 30*sec, time.Date(2026, 10, 26, 11, 14, 58, 500e6, time.UTC), models.ClockOffset{Min: 30*time.Minute - 29100*ms, Max: 30*time.Minute + 500*ms, Res: 30 * sec}},
-		{30*time.Minute + 17*sec, time.Date(2026, 10, 26, 11, 14, 17, 500e6, time.UTC), models.ClockOffset{Min: 30*time.Minute - 1100*ms, Max: 30*time.Minute + 28500*ms, Res: sec}},
+		{30*time.Minute + 30*sec, time.Date(2026, 10, 26, 11, 14, 58, 500e6, time.UTC), models.ClockOffset{Min: 30*time.Minute - 29100*ms, Max: 30*time.Minute + 500*ms, Res: sec, Layout: models.LayoutTyped}},
+		{30*time.Minute + 17*sec, time.Date(2026, 10, 26, 11, 14, 17, 500e6, time.UTC), models.ClockOffset{Min: 30*time.Minute - 1100*ms, Max: 30*time.Minute + 28500*ms, Res: sec, Layout: models.LayoutTyped}},
 	} {
 		fread := row.read.Add(61 * sec)
 		mc := clockOffsetCall{call: row.read.Add(600 * ms), fcall: fread.Add(600 * ms)}
 		mc.w = (&Window{Rec: Span{From: row.read.Add(-28 * sec), To: mc.call}, F: Span{From: fread.Add(-29 * sec), To: mc.fcall}}).ComparesOffsets()
 		ln := mc.classify(p, row.read.Truncate(time.Minute).Add(row.ttl), fread.Truncate(time.Minute).Add(row.ttl), sec, mc.w)
-		if want := clockOffsetApartWhy(p, row.want, time.Minute, sec); ln.Kind != KindUnaccounted || ln.Offset != nil || ln.Why != want || !strings.Contains(ln.Why, ", but its two values stand 1m apart, a whole number of minutes, the unit above the 1s their encoding writes: an application that cuts its value to the minute") {
+		if want := cutAmbiguousWhy(p, row.want, time.Minute, time.Minute); ln.Kind != KindUnaccounted || ln.Offset != nil || ln.Why != want || !strings.Contains(ln.Why, "but its two values stand 1m apart, a whole number of 1m: an application that cuts its value to 1m") {
 			t.Errorf("FALSE GREEN? a minute cut plus %s at a second's encoding: %s %+v (%s); want refused: %s", row.ttl, ln.Kind, ln.Offset, ln.Why, want)
 		}
 	}
 	// Two millisecond values the application does not cut that stand a
-	// whole number of seconds apart by chance (62 s): refused the same.
+	// whole number of seconds apart by chance (62 s, a slow call's): one
+	// offset at the millisecond holds both, and one at the second could:
+	// refused, naming both.
 	apart := clockOffsetCall{call: c.call, fcall: c.call.Add(62005 * ms)}
 	apart.w = (&Window{Rec: Span{From: apart.call.Add(-50 * ms), To: apart.call}, F: Span{From: apart.fcall.Add(-60 * ms), To: apart.fcall}}).ComparesOffsets()
-	if ln := apart.classify(p, apart.call.Add(-40*ms+30*time.Minute), apart.fcall.Add(-45*ms+30*time.Minute), ms, apart.w); ln.Kind != KindUnaccounted || ln.Offset != nil || !strings.HasPrefix(ln.Why, p+" = clock + 30m (") || !strings.Contains(ln.Why, ", but its two values stand 1m2s apart, a whole number of seconds, the unit above the 1ms their encoding writes") {
-		t.Errorf("two millisecond values 62 s apart: %s %+v (%s); want refused, naming the gap", ln.Kind, ln.Offset, ln.Why)
+	apartAt := models.ClockOffset{Min: 30*time.Minute - 40*ms, Max: 30*time.Minute + 11*ms, Res: ms, Layout: models.LayoutTyped}
+	if ln := apart.classify(p, apart.call.Add(-40*ms+30*time.Minute), apart.fcall.Add(-45*ms+30*time.Minute), ms, apart.w); ln.Kind != KindUnaccounted || ln.Offset != nil || ln.Why != cutAmbiguousWhy(p, apartAt, 62*sec, sec) {
+		t.Errorf("two millisecond values 62 s apart: %s %+v (%s); want refused: %s", ln.Kind, ln.Offset, ln.Why, cutAmbiguousWhy(p, apartAt, 62*sec, sec))
+	}
+
+	// Thirty minutes cut to the second, each window 57 s wide: from
+	// 29m59.7s up to 30m57.155s, 57.455 s wide, which with one second is
+	// narrower than the minute it reads in, but with the three a replay's
+	// check spans (one cut each side and the cut's start) is not: refused as
+	// too wide, naming the range.
+	long := clockOffsetCall{call: time.Date(2026, 10, 26, 11, 14, 17, 300e6, time.UTC)}
+	long.fcall = long.call.Add(FullRoundLead)
+	long.w = (&Window{Rec: Span{From: long.call.Add(-57 * sec), To: long.call}, F: Span{From: long.fcall.Add(-57 * sec), To: long.fcall}}).ComparesOffsets()
+	longWant := models.ClockOffset{Min: 30*time.Minute - 300*ms, Max: 30*time.Minute + 57155*ms, Res: sec, Layout: models.LayoutTyped}
+	if ln := long.classify(p, long.call.Truncate(sec).Add(30*time.Minute), long.fcall.Truncate(sec).Add(30*time.Minute), ms, long.w); ln.Kind != KindUnaccounted || ln.Offset != nil || ln.Why != clockOffsetWideWhy(p, longWant, ms) {
+		t.Errorf("FALSE GREEN? thirty minutes cut to the second, windows 57 s wide: %s %+v (%s); want refused: %s", ln.Kind, ln.Offset, ln.Why, clockOffsetWideWhy(p, longWant, ms))
 	}
 
 	// N2: a value a millisecond after its call in both runs: from 1 ms up
@@ -1777,17 +1808,106 @@ func TestAValueCutCoarserThanItsEncodingIsRefusedAsACut(t *testing.T) {
 	}
 }
 
-// B1 and S2 of the review of the cut's first fix: two values that share a
-// granularity coarser than FullRoundLead (an hour cut, its boundaries on a
-// zone's half hour, which the epoch reads as thirty minutes) show no offset,
-// even where windows over an hour wide put one offset in both runs' bounds:
+// The acceptance of 2026-10-28: eui's expiresAt, "2026-11-26T16:59:10.000Z",
+// the call's clock plus thirty days with its milliseconds zeroed, stored at
+// the millisecond. Its test called at 16:59:10.1, its window 300 ms wide;
+// record's full round called at 17:01:26.3 (in one minute) or 17:02:03.3
+// (across one). Both are learned as clock + 30d at the second, and every
+// replay a day on, its read anywhere in its second, holds the read plus
+// thirty days cut down and the widened span's start (a second before the
+// second that holds its window's start plus the offset); a millisecond
+// past either edge of the widened span, the recorded value, one three
+// seconds stale or four ahead of the read, and twenty-nine or thirty-one
+// days never do. With record's full round at the lead, its read up to half
+// a second either way, or two seconds early, against the recording's, it
+// is learned at the second; with F's read 1.4 s early its value stands a
+// whole minute after the recording's, which a minute's cut plus 30d and
+// some seconds writes too: refused, naming both cuts.
+func TestAnExpiryOfThirtyDaysWithItsMillisecondsZeroedIsKeptAndCheckedAtTheSecond(t *testing.T) {
+	const p = "body.expiresAt"
+	const month = 30 * 24 * time.Hour
+	ms, sec := time.Millisecond, time.Second
+	call := time.Date(2026, 10, 27, 16, 59, 10, 100e6, time.UTC)
+	rec := call.Add(month).Truncate(sec)
+	if got := rec.Format("2006-01-02T15:04:05.000Z07:00"); got != "2026-11-26T16:59:10.000Z" {
+		t.Fatalf("precondition: the recorded value is %s, want eui's", got)
+	}
+	for _, f := range []struct {
+		name  string
+		fcall time.Time
+	}{
+		{"a full round in one minute", time.Date(2026, 10, 27, 17, 1, 26, 300e6, time.UTC)},
+		{"a full round across a minute", time.Date(2026, 10, 27, 17, 2, 3, 300e6, time.UTC)},
+	} {
+		oc := clockOffsetCall{call: call, fcall: f.fcall}
+		oc.w = (&Window{Rec: Span{From: call.Add(-300 * ms), To: call}, F: Span{From: f.fcall.Add(-300 * ms), To: f.fcall}}).ComparesOffsets()
+		ln := oc.classify(p, rec, f.fcall.Add(month).Truncate(sec), ms, oc.w)
+		want := models.ClockOffset{Min: month - 100*ms, Max: month + sec, Res: sec, Layout: models.LayoutTyped}
+		if ln.Kind != KindClockOffset || ln.Offset == nil || *ln.Offset != want || !strings.HasPrefix(ln.Why, p+" = clock + 30d (") {
+			t.Errorf("FALSE RED: eui's expiresAt, %s: %s %+v (%s); want the offset %+v", f.name, ln.Kind, ln.Offset, ln.Why, want)
+			continue
+		}
+		base := call.Add(26 * time.Hour).Truncate(sec)
+		for step := time.Duration(0); step < sec; step += 10 * ms {
+			from := base.Add(step)
+			to, read := from.Add(300*ms), from.Add(150*ms)
+			lo, hi := from.Add(want.Min).Truncate(sec).Add(-sec), to.Add(want.Max).Add(sec)
+			if ok, _ := CheckClockRead(p, want, InstantLeaf(p, p, lo, ms), Span{From: from, To: to}, true); !ok {
+				t.Errorf("FALSE RED: eui's expiresAt (%s), the widened span's start: refused", f.name)
+			}
+			if ok, _ := CheckClockRead(p, want, InstantLeaf(p, p, lo.Add(-ms), ms), Span{From: from, To: to}, true); ok {
+				t.Errorf("FALSE GREEN: eui's expiresAt (%s), a millisecond before the widened span: passed", f.name)
+			}
+			if ok, _ := CheckClockRead(p, want, InstantLeaf(p, p, hi.Add(ms), ms), Span{From: from, To: to}, true); ok {
+				t.Errorf("FALSE GREEN: eui's expiresAt (%s), a millisecond after the widened span: passed", f.name)
+			}
+			for _, row := range []struct {
+				name string
+				at   time.Time
+				want bool
+			}{
+				{"the read plus thirty days, cut", read.Add(month).Truncate(sec), true},
+				{"the recorded value", rec, false},
+				{"three seconds stale", read.Add(month).Truncate(sec).Add(-3 * sec), false},
+				{"four seconds ahead", read.Add(month).Truncate(sec).Add(4 * sec), false},
+				{"twenty-nine days", read.Add(month - 24*time.Hour).Truncate(sec), false},
+				{"thirty-one days", read.Add(month + 24*time.Hour).Truncate(sec), false},
+			} {
+				if got, why := CheckClockRead(p, *ln.Offset, InstantLeaf(p, p, row.at, ms), Span{From: from, To: to}, true); got != row.want {
+					t.Errorf("%s: eui's expiresAt (%s), %s, a replay's read %s into its second: holds %v (%s), want %v", map[bool]string{true: "FALSE RED", false: "FALSE GREEN"}[row.want], f.name, row.name, read.Sub(read.Truncate(sec)), got, why, row.want)
+				}
+			}
+		}
+	}
+	for _, drift := range []time.Duration{-2 * sec, -500 * ms, 0, 500 * ms, -1400 * ms} {
+		fcall := call.Add(FullRoundLead + drift)
+		oc := clockOffsetCall{call: call, fcall: fcall}
+		oc.w = (&Window{Rec: Span{From: call.Add(-300 * ms), To: call}, F: Span{From: fcall.Add(-300 * ms), To: fcall}}).ComparesOffsets()
+		ln := oc.classify(p, rec, fcall.Add(month).Truncate(sec), ms, oc.w)
+		if drift == -1400*ms {
+			if ln.Kind != KindUnaccounted || ln.Offset != nil || !strings.Contains(ln.Why, "but its two values stand 1m apart, a whole number of 1m") {
+				t.Errorf("eui's expiresAt, F's read 1.4 s early, its value a whole minute on: %s %+v (%s); want refused, naming both cuts", ln.Kind, ln.Offset, ln.Why)
+			}
+			continue
+		}
+		if ln.Kind != KindClockOffset || ln.Offset == nil || ln.Offset.Res != sec || ln.Offset.Min > month || ln.Offset.Max <= month {
+			t.Errorf("FALSE RED: eui's expiresAt, F's read %s off the lead: %s %+v (%s); want clock + 30d at the second", drift, ln.Kind, ln.Offset, ln.Why)
+		}
+	}
+}
+
+// B1 and S2 of the review of the cut's first fix: two values cut to an hour
+// (its boundaries on a zone's half hour, which the epoch reads as thirty
+// minutes) show no offset (offsetCut: they stand a whole hour apart), even
+// where windows over an hour wide put one offset in both runs' bounds:
 // thirty minutes would read the hour cut finer than it is, and a time to
 // live changed by an hour could hold. A value that did not move (its text
-// drifted, not its moment) shows none either.
+// drifted, not its moment) shows none either. Two values cut to the minute
+// that share two minutes, more than FullRoundLead, show one, at the minute.
 func TestACutCoarserThanTheLeadShowsNoOffset(t *testing.T) {
 	ms := time.Millisecond
 	// UTC+5:30: the local hour turns at :30 UTC. The recording reads at
-	// 12:29:59, its value 11:30 + 2h; F reads 61.5 s later, past the turn,
+	// 12:29:59, its value 11:30 + 2h; F reads FullRoundLead later, past the turn,
 	// its value 12:30 + 2h. Each window opens 70 minutes before its read.
 	readR := time.Date(2026, 10, 26, 12, 29, 59, 0, time.UTC)
 	readF := readR.Add(FullRoundLead)
@@ -1806,7 +1926,7 @@ func TestACutCoarserThanTheLeadShowsNoOffset(t *testing.T) {
 	}
 	// N1 of the offset rule's third review: Truncate(time.Hour) plus ninety
 	// minutes, in UTC. The recording reads at 12:59:59, its value 13:30; F
-	// reads 61.5 s later, past the hour, its value 14:30. The two share
+	// reads FullRoundLead later, past the hour, its value 14:30. The two share
 	// thirty minutes, and windows 70 minutes wide put one range of offsets in
 	// both: no offset.
 	readR = time.Date(2026, 10, 26, 12, 59, 59, 0, time.UTC)
@@ -1819,16 +1939,28 @@ func TestACutCoarserThanTheLeadShowsNoOffset(t *testing.T) {
 	if o, ok := clockOffsetOf(r, l, w); ok {
 		t.Errorf("FALSE GREEN? an hour cut plus ninety minutes: %+v (%s); want no offset", o, o)
 	}
+	// The recording reads at 12:02:58.5, F FullRoundLead later, past two
+	// minutes' turns: 14:02 and 14:04, two hours on, share two minutes.
+	readR = time.Date(2026, 10, 26, 12, 2, 58, 500e6, time.UTC)
+	readF = readR.Add(FullRoundLead)
+	r.at, l.at = readR.Truncate(time.Minute).Add(2*time.Hour), readF.Truncate(time.Minute).Add(2*time.Hour)
+	w = &Window{Rec: Span{From: readR.Add(-50 * ms), To: readR.Add(10 * ms)}, F: Span{From: readF.Add(-50 * ms), To: readF.Add(10 * ms)}}
+	if g := sharedGrain(r.at, l.at); g != 2*time.Minute {
+		t.Fatalf("precondition: the two minute values share %s, want two minutes", g)
+	}
+	if o, ok := clockOffsetOf(r, l, w); !ok || o.Res != time.Minute || o.Min >= 2*time.Hour || o.Max <= 2*time.Hour {
+		t.Errorf("FALSE RED: two hours cut to the minute, its values sharing two minutes: %+v, %v; want two hours at the minute", o, ok)
+	}
 }
 
 // N2 of the review of the cut's first fix: a reason says what set the
 // resolution it names.
 func TestAReasonSaysWhatSetTheResolution(t *testing.T) {
 	ms := time.Millisecond
-	if got, want := resolutionOf(time.Second, ms), "1s (both runs' values are whole multiples of it, coarser than the 1ms their encoding writes)"; got != want {
+	if got, want := resolutionOf(time.Second, ms), "1s (the cut both runs' values show, coarser than the 1ms their encoding writes)"; got != want {
 		t.Errorf("a shared second: %q, want %q", got, want)
 	}
-	if got, want := resolutionOf(time.Minute, ms), "1m (both runs' values are whole multiples of it, coarser than the 1ms their encoding writes)"; got != want {
+	if got, want := resolutionOf(time.Minute, ms), "1m (the cut both runs' values show, coarser than the 1ms their encoding writes)"; got != want {
 		t.Errorf("a shared minute: %q, want %q", got, want)
 	}
 	if got, want := resolutionOf(ms, ms), "1ms (the one its encoding writes)"; got != want {
@@ -1839,24 +1971,44 @@ func TestAReasonSaysWhatSetTheResolution(t *testing.T) {
 	}
 }
 
-// Two values stand a whole number of the unit above their encoding apart
-// where their gap is a whole number of seconds at a millisecond's encoding,
-// of milliseconds at a microsecond's, of minutes at a second's, of hours at
-// a minute's; any gap does at an encoding no unit is above (a day's).
-func TestTwoValuesAWholeUnitAboveTheirEncodingApart(t *testing.T) {
+// An offset's cut (offsetReading) is the one both values show; where their
+// gap is a whole multiple of a coarser step, that step where the values'
+// own cut puts no offset in both runs, and refused, naming both, where it
+// does. Uncut millisecond values a fast call's lead apart: the
+// millisecond; two whole seconds, a fast call's: the second; a minute's
+// start plus 30m30s, narrow windows: the minute (the second holds no one
+// offset); 10 ms values at a microsecond's encoding: 10 ms; at a
+// millisecond's: the millisecond (a decimal step counts only at 1,000
+// times the encoding: such a writer is checked at its encoding, the flake
+// the PR text states); an hour apart on the half hour: refused naming the
+// hour; a value that did not move: none, no reason.
+func TestAnOffsetsCutIsTheOneItsValuesShowOrItsGapsWhereTheirsHoldsNone(t *testing.T) {
 	us, ms, sec, min := time.Microsecond, time.Millisecond, time.Second, time.Minute
+	read := time.Date(2026, 10, 26, 11, 14, 17, 123e6, time.UTC)
+	fread := read.Add(FullRoundLead)
+	narrow := &Window{Rec: Span{From: read.Add(-20 * ms), To: read.Add(20 * ms)}, F: Span{From: fread.Add(-20 * ms), To: fread.Add(20 * ms)}}
+	in := func(at time.Time, enc time.Duration) typedInstant {
+		return typedInstant{at: at, res: enc, names: namesMoment}
+	}
 	for _, row := range []struct {
-		gap, enc time.Duration
-		want     bool
+		name string
+		enc  time.Duration
+		a, b time.Time
+		w    *Window
+		want time.Duration
+		why  string
 	}{
-		{62 * sec, ms, true}, {61500 * ms, ms, false}, {61537 * ms, ms, false},
-		{time.Minute, sec, true}, {62 * sec, sec, false}, {2 * min, sec, true},
-		{3 * ms, us, true}, {1500 * us, us, false},
-		{time.Hour, min, true}, {61 * min, min, false},
-		{min, 24 * time.Hour, true}, {sec, 48 * time.Hour, true},
+		{"uncut, a fast call's lead apart", ms, read.Add(time.Hour), fread.Add(time.Hour), narrow, ms, ""},
+		{"two whole seconds", ms, read.Add(time.Hour).Truncate(sec), fread.Add(time.Hour).Truncate(sec), narrow, sec, ""},
+		{"a minute's start plus 30m30s", sec, read.Truncate(min).Add(30*min + 30*sec), fread.Truncate(min).Add(30*min + 30*sec), narrow, min, ""},
+		{"10 ms at a microsecond's encoding", us, read.Add(time.Hour).Truncate(10 * ms), fread.Add(time.Hour).Truncate(10 * ms), narrow, 10 * ms, ""},
+		{"10 ms at a millisecond's encoding", ms, read.Add(time.Hour).Truncate(10 * ms), fread.Add(time.Hour).Truncate(10 * ms), narrow, ms, ""},
+		{"an hour cut on the half hour, plus two hours", ms, time.Date(2026, 10, 26, 13, 30, 0, 0, time.UTC), time.Date(2026, 10, 26, 14, 30, 0, 0, time.UTC), &Window{Rec: Span{From: time.Date(2026, 10, 26, 12, 29, 58, 950e6, time.UTC), To: time.Date(2026, 10, 26, 12, 29, 59, 50e6, time.UTC)}, F: Span{From: time.Date(2026, 10, 26, 12, 31, 0, 495e6, time.UTC), To: time.Date(2026, 10, 26, 12, 31, 0, 595e6, time.UTC)}}, 0, "cut to 1h, but keploy checks a clock read plus an offset only at a cut of a minute or finer"},
+		{"a value that did not move", ms, read.Add(time.Hour), read.Add(time.Hour), narrow, 0, ""},
 	} {
-		if got := apartByUnits(row.gap, row.enc); got != row.want {
-			t.Errorf("%s apart at an encoding of %s: %v, want %v", row.gap, row.enc, got, row.want)
+		o, why, ok := offsetReading("p", in(row.a, row.enc), in(row.b, row.enc), row.w)
+		if row.want != 0 && (!ok || why != "" || o.Res != row.want) || row.want == 0 && (ok || !strings.Contains(why, row.why) || (row.why == "") != (why == "")) {
+			t.Errorf("%s: %+v %v (%s); want the cut %s, why %q", row.name, o, ok, why, row.want, row.why)
 		}
 	}
 }
@@ -1999,9 +2151,8 @@ func TestATypedInstantWithNoCallWindowIsAClockReadCheckedAtReplay(t *testing.T) 
 // window is the same whichever value the full round read, and a stamp
 // 400 ms before its call's span is refused under each. A text one and a
 // time of day the same. A value the application cut to the second (both
-// whole seconds) is learned at the second, the unit above its encoding,
-// whatever more the two share (7 s, or 2 s), and every replay refuses it,
-// naming the cut.
+// whole seconds) is learned at the second's cut, whatever more the two
+// share (7 s, or 2 s).
 func TestAPlainClockReadsResolutionIsItsEncodingsNotAChanceGrain(t *testing.T) {
 	const p = "body.u.processed_at"
 	ms := time.Millisecond
@@ -2059,16 +2210,13 @@ func TestAPlainClockReadsResolutionIsItsEncodingsNotAChanceGrain(t *testing.T) {
 	if got := readRes(24*time.Hour, 48*time.Hour); got != 24*time.Hour {
 		t.Errorf("readRes of a day's encoding sharing two days = %v; want the day", got)
 	}
-	// Cut to the second: 7 s shared, or 2 s, learned at the second alike,
-	// and refused at replay naming the cut.
+	// Cut to the second: 7 s shared, or 2 s, learned alike at the second's
+	// cut (readRes), never at the 7 s the two share by chance.
 	sec := time.Unix(base.Unix()/7*7+7, 0).UTC()
 	for _, l := range []time.Time{sec.Add(63 * time.Second), sec.Add(62 * time.Second)} {
-		o := learn(sec, l)
-		if o.Res != time.Second {
-			t.Errorf("cut to the second, %v then %v (sharing %v): Res = %v; want 1s", sec, l, sharedGrain(sec, l), o.Res)
-		}
-		if ok, why := CheckClockRead(p, o, typed(now.Add(time.Second)), Span{From: now.Add(time.Second - 5*ms), To: now.Add(time.Second + 5*ms)}, true); ok || !strings.Contains(why, "the application cuts its value") {
-			t.Errorf("cut to the second, at replay: %v (%s); want refused naming the cut", ok, why)
+		ln := ClassifyIn(clockedDrifts(), []string{p}, shape(typed(l)), shape(typed(sec)), sec.Add(ms), nil, nil, nil, nil)[0]
+		if ln.Kind != KindClockRead || ln.Read == nil || ln.Read.Res != time.Second {
+			t.Errorf("cut to the second, %v then %v (sharing %v): %s Read=%+v (%s); want learned at the 1s cut", sec, l, sharedGrain(sec, l), ln.Kind, ln.Read, ln.Why)
 		}
 	}
 }
@@ -2080,14 +2228,14 @@ func TestAPlainClockReadsResolutionIsItsEncodingsNotAChanceGrain(t *testing.T) {
 // never coarser because one of them happened to end in zeros, and a
 // nine-digit replay value passes. A replay's value with fewer digits passes
 // where it is the same instant at its own precision (the writer dropped its
-// zeros; ruled 2026-10-27). Two values that both end in zeros at a unit are
-// read at it, and a replay value with more digits is refused as a cut (a
-// stated limit: the same at every replay of that recording). A value the
-// application does cut is still refused naming the cut: written with nine
-// digits on both sides, with three and six, or as an epoch in seconds with
-// a fraction (read exactly, never through a float); and so is a cut value
-// of a form whose layout fixes its resolution (an epoch in nanoseconds, a
-// $date), wherever its replay value falls.
+// zeros, 2026-10-27). Two values that both end in zeros at a step of a
+// millisecond or finer are read at it, and a replay reads the cut by its
+// own value: one that shows none is checked at its own resolution, one that
+// shows a cut at that cut. A value the application cuts to the second is
+// learned at the cut (founder decision, 2026-10-27): written with nine
+// digits on both sides, with three and six, as a time of day, or as a
+// $date; and an epoch in seconds with a fraction is read exactly, never
+// through a float.
 func TestATextClockReadsFractionDigitsAreNoEvidenceOfItsResolution(t *testing.T) {
 	const p = "body.at"
 	str := func(v string) Leaf { return Leaf{Path: p, Noise: p, Type: String, Value: v} }
@@ -2098,6 +2246,16 @@ func TestATextClockReadsFractionDigitsAreNoEvidenceOfItsResolution(t *testing.T)
 		o, ok := ln.Clock()
 		if !plainRead(ln) || !ok {
 			t.Fatalf("%s then %s: %s Read=%+v (%s); want a plain read of the clock", rec, live, ln.Kind, ln.Read, ln.Why)
+		}
+		return o
+	}
+	// cutAt asserts the learn step learns rec then live at cut, the coarse
+	// cut both show above the finer of their encodings, and returns it.
+	cutAt := func(what, rec, live string, cut time.Duration) models.ClockOffset {
+		t.Helper()
+		o := learn(rec, live)
+		if o.Res != cut {
+			t.Errorf("%s, %s then %s: Res = %v; want learned at the %v cut", what, rec, live, o.Res, cut)
 		}
 		return o
 	}
@@ -2123,71 +2281,1125 @@ func TestATextClockReadsFractionDigitsAreNoEvidenceOfItsResolution(t *testing.T)
 		check(what+", before the span", o, "2026-10-28T07:29:59.995123456Z", false, "it changed")
 	}
 	// Both values happened to end in zeros: learned at the microsecond
-	// their digits show; a six-digit replay value passes, a nine-digit one
-	// is refused as a cut (the stated limit), never passed.
+	// their digits show. A replay reads the cut by its own value: a
+	// nine-digit value that is no whole microsecond shows none and is
+	// checked at its own nanosecond, one that is one is checked at the
+	// microsecond; neither is refused as a cut, and one before the span is
+	// refused as changed.
 	both := learn(six, "2026-10-27T03:31:02.032456Z")
 	if both.Res != time.Microsecond {
 		t.Errorf("both values with six digits: Res = %v; want 1µs", both.Res)
 	}
 	check("both values ending in 000ns", both, "2026-10-28T07:30:00.005123Z", true, "")
-	check("both values ending in 000ns, nine digits", both, "2026-10-28T07:30:00.005123456Z", false, "the application cuts its value")
-	// Cut to the second, nine digits on both sides: the cut is learned (the
-	// microsecond above the nanosecond) and a replay value that is cut so
-	// too is refused naming it, wherever in the span its read fell.
-	cut := learn("2026-10-27T03:30:00.000000000Z", "2026-10-27T03:31:02.000000000Z")
-	if cut.Res != time.Microsecond {
-		t.Errorf("cut to the second with nine digits: Res = %v; want the 1µs cut", cut.Res)
+	check("both values ending in 000ns, nine digits", both, "2026-10-28T07:30:00.005123456Z", true, "")
+	check("both values ending in 000ns, nine digits ending in 000ns", both, "2026-10-28T07:30:00.005123000Z", true, "")
+	check("both values ending in 000ns, nine digits, a nanosecond before the span (one unit stale)", both, "2026-10-28T07:29:59.999999999Z", true, "")
+	check("both values ending in 000ns, nine digits, 3ns before the span", both, "2026-10-28T07:29:59.999999997Z", false, "it changed")
+	// Cut to the second, nine digits on both sides: the cut (the coarsest
+	// step both values are whole multiples of) is learned, and a replay
+	// value cut so passes wherever in its second its read fell, and a
+	// second stale, and is refused two seconds stale, naming the cut.
+	o := cutAt("cut to the second with nine digits", "2026-10-27T03:30:00.000000000Z", "2026-10-27T03:31:02.000000000Z", time.Second)
+	check("cut to the second with nine digits", o, "2026-10-28T07:30:00.000000000Z", true, "")
+	check("cut to the second with nine digits, a second stale", o, "2026-10-28T07:29:59.000000000Z", true, "")
+	check("cut to the second with nine digits, two seconds stale", o, "2026-10-28T07:29:58.000000000Z", false, "it changed (read as standing for the whole 1s it is cut to)")
+	// Cut to the second, written with three digits, then six: the same,
+	// above the finer of the two encodings.
+	cutAt("cut to the second with three digits, then six", "2026-10-27T03:30:00.000Z", "2026-10-27T03:31:02.000000Z", time.Second)
+	// Cut to the minute, written to the second: learned at the minute.
+	cutAt("cut to the minute, written to the second", "2026-10-27T03:30:00Z", "2026-10-27T03:32:00Z", time.Minute)
+	// A replay reads a Res coarser than its value's encoding by the cut its
+	// own value shows, no coarser than Res: at a Res of an hour and a
+	// second's encoding, a value on a whole minute is checked at the minute
+	// (passed within a minute of the span, refused two minutes stale), one
+	// on a whole hour at the hour, and one that is no whole minute shows no
+	// cut above its second and is checked at it.
+	hour := models.ClockOffset{Res: time.Hour, Layout: "iso-second"}
+	late := Span{From: now.Add(time.Second + 5*time.Millisecond), To: now.Add(time.Second + 25*time.Millisecond), Zone: time.UTC, Own: true}
+	for _, c := range []struct {
+		v, why string
+		ok     bool
+	}{
+		{"2026-10-28T07:30:00Z", "", true},
+		{"2026-10-28T07:29:00Z", "", true},
+		{"2026-10-28T07:28:00Z", "it changed (read as standing for the whole 1m it is cut to)", false},
+		{"2026-10-28T07:00:00Z", "", true},
+		{"2026-10-28T06:00:00Z", "", true},
+		{"2026-10-28T05:00:00Z", "it changed (read as standing for the whole 1h it is cut to)", false},
+	} {
+		if ok, why := CheckClockRead(p, hour, str(c.v), late, true); ok != c.ok || !strings.HasSuffix(why, c.why) {
+			t.Errorf("a Res of 1h, replay %s: %v (%s); want %v %q", c.v, ok, why, c.ok, c.why)
+		}
 	}
-	check("cut to the second", cut, "2026-10-28T07:30:00.000000000Z", false, "the application cuts its value")
-	// Cut to the second, written with three digits, then six: the cut is
-	// the second above the coarser's millisecond, so a three-digit replay
-	// value cut so is refused too, not checked at its millisecond.
-	mixed := learn("2026-10-27T03:30:00.000Z", "2026-10-27T03:31:02.000000Z")
-	if mixed.Res != time.Second {
-		t.Errorf("cut to the second with three digits, then six: Res = %v; want the 1s cut", mixed.Res)
+	if ok, why := CheckClockRead(p, hour, str("2026-10-28T07:30:01Z"), late, true); !ok {
+		t.Errorf("a Res of 1h, a replay value no whole minute: refused (%s); want it checked at its second, and passed", why)
 	}
-	check("cut to the second, three digits", mixed, "2026-10-28T07:30:00.000Z", false, "the application cuts its value")
-	check("cut to the second, six digits", mixed, "2026-10-28T07:30:00.000000Z", false, "the application cuts its value")
 	// An epoch in seconds cut to the millisecond, with six digits: read
-	// exactly, both values are whole milliseconds, a cut.
+	// exactly, both values are whole milliseconds, a cut, which a replay
+	// checks at the cut: a value cut so passes in the millisecond its read
+	// fell in and in the one before, and not in the one before that.
 	if r := textClockRead("1793158200.123000", "1793158262.456000"); r == nil || r.Res != time.Millisecond {
 		t.Errorf("an epoch in seconds cut to the millisecond: %+v; want a Res of the 1ms cut", r)
 	} else {
-		check("an epoch in seconds cut to the millisecond", *r, "1793172600.005000", false, "the application cuts its value")
+		check("an epoch in seconds cut to the millisecond, checked at the cut", *r, "1793172600.005000", true, "")
+		check("an epoch in seconds cut to the millisecond, the one before the span", *r, "1793172599.999000", true, "")
+		check("an epoch in seconds cut to the millisecond, two before the span", *r, "1793172599.998000", false, "it changed")
 	}
 	// A time of day and an epoch in seconds read their fraction the same.
 	if r := clockedDrifts().todRead(3*time.Hour+30*time.Minute+495123*time.Microsecond, 3*time.Hour+31*time.Minute+2032456789, time.Microsecond, time.Nanosecond, "time-second", "time-second", nil, call); r.Res != time.Nanosecond {
 		t.Errorf("a time of day with six digits, then nine: Res = %v; want 1ns", r.Res)
 	}
+	if r := clockedDrifts().todRead(3*time.Hour+30*time.Minute+2032456789, 3*time.Hour+31*time.Minute+495123*time.Microsecond, time.Nanosecond, time.Microsecond, "time-second", "time-second", nil, call); r.Res != time.Nanosecond {
+		t.Errorf("a time of day with nine digits, then six: Res = %v; want 1ns", r.Res)
+	}
+	// A time of day cut to the second, written with three digits and with
+	// six, in either order: learned at its cut of a second; a replay value
+	// cut so is checked at the cut in either form (passed in the span's
+	// second and a second stale, refused two seconds stale, naming the cut);
+	// one that is no whole second is checked at its own millisecond.
+	cutAt("a time of day cut to the second, three digits then six", "03:30:00.000", "03:31:02.000000", time.Second)
+	cutAt("a time of day cut to the second, six digits then three", "03:30:00.000000", "03:31:02.000", time.Second)
+	tods := Span{From: now, To: now.Add(20 * time.Millisecond), Zone: time.UTC, Own: true}
+	for _, pr := range [][2]time.Duration{{time.Millisecond, time.Microsecond}, {time.Microsecond, time.Millisecond}} {
+		r := clockedDrifts().todRead(3*time.Hour+30*time.Minute, 3*time.Hour+31*time.Minute+2*time.Second, pr[0], pr[1], "time-second", "time-second", nil, call)
+		if r.Res != time.Second {
+			t.Errorf("a time of day cut to the second, written at %v then %v: Res = %v; want the 1s cut", pr[0], pr[1], r.Res)
+			continue
+		}
+		for _, v := range []string{"07:30:00.000", "07:30:00.000000"} {
+			if ok, why := CheckClockRead(p, *r, str(v), tods, true); !ok {
+				t.Errorf("a time of day cut to the second, written at %v then %v, replay %s: refused (%s); want checked at the cut, and passed", pr[0], pr[1], v, why)
+			}
+		}
+		for _, v := range []string{"07:29:59.000", "07:29:59.000000"} {
+			if ok, why := CheckClockRead(p, *r, str(v), tods, true); !ok {
+				t.Errorf("a time of day cut to the second, written at %v then %v, replay %s a second stale: refused (%s); want passed", pr[0], pr[1], v, why)
+			}
+		}
+		for _, v := range []string{"07:29:58.000", "07:29:58.000000"} {
+			if ok, why := CheckClockRead(p, *r, str(v), tods, true); ok || !strings.HasSuffix(why, "it changed (read as standing for the whole 1s it is cut to)") {
+				t.Errorf("a time of day cut to the second, written at %v then %v, replay %s two seconds stale: %v (%s); want refused naming the cut", pr[0], pr[1], v, ok, why)
+			}
+		}
+		if ok, why := CheckClockRead(p, *r, str("07:30:00.005"), tods, true); !ok {
+			t.Errorf("a time of day cut to the second, written at %v then %v, replay 07:30:00.005: refused (%s); want it checked at its millisecond, and passed", pr[0], pr[1], why)
+		}
+	}
+	// An epoch in seconds with nine digits on both sides is read exactly, to
+	// the nanosecond: no cut, and a nine-digit replay value in the span
+	// passes, and so does one a nanosecond before it; one 3 ns before it is
+	// refused.
+	if r := textClockRead("1793158200.495123456", "1793158262.032456789"); r == nil || r.Res != time.Nanosecond {
+		t.Errorf("an epoch in seconds with nine digits: %+v; want a Res of 1ns", r)
+	} else {
+		check("an epoch in seconds with nine digits", *r, "1793172600.005123456", true, "")
+		check("an epoch in seconds with nine digits, a nanosecond before the span", *r, "1793172599.999999999", true, "")
+		check("an epoch in seconds with nine digits, 3ns before the span", *r, "1793172599.999999997", false, "it changed")
+	}
 	if r := textClockRead("1793158200.495", "1793158262.032456"); r == nil || r.Res != time.Microsecond {
 		t.Errorf("an epoch in seconds with three digits, then six: %+v; want a Res of 1µs", r)
 	}
 	// One fraction digit, the fewest the layout reads: a tenth of a second,
-	// read exactly (the span's own tenth passes; the next one, which starts
-	// after the span ends, is refused).
+	// read exactly (the span's own tenth passes, and so does the next one,
+	// which starts after the span ends, one tenth ahead; the one after it is
+	// refused).
 	if r := textClockRead("1793158200.5", "1793158262.3"); r == nil || r.Res != 100*time.Millisecond {
 		t.Errorf("an epoch in seconds with one digit: %+v; want a Res of 100ms", r)
 	} else {
 		check("an epoch in seconds with one digit", *r, "1793172600.0", true, "")
-		check("an epoch in seconds with one digit, after the span", *r, "1793172600.1", false, "it changed")
+		check("an epoch in seconds with one digit, after the span", *r, "1793172600.1", true, "")
+		check("an epoch in seconds with one digit, two tenths after the span", *r, "1793172600.2", false, "it changed")
 	}
 	// A layout that fixes its resolution reads no fraction: a cut epoch in
-	// nanoseconds, and a cut $date, are refused at replay even where the
-	// replay's value is no whole number of the cut.
+	// nanoseconds is learned at its cut of a millisecond. A replay value
+	// that is no whole number of the cut shows none: it is checked at its
+	// own resolution and passes in the span; one cut to the millisecond is
+	// checked at it. A $date cut to the second is learned at the cut.
 	ns := func(at time.Time) string { return strconv.FormatInt(at.UnixNano(), 10) }
 	sec := time.Date(2026, 10, 26, 9, 0, 0, 123000000, time.UTC)
-	if r := textClockRead(ns(sec), ns(sec.Add(FullRoundLead+7*time.Millisecond))); r == nil || r.Res != time.Microsecond {
-		t.Fatalf("a cut epoch in nanoseconds: %+v; want a Res of 1µs, a cut", r)
-	} else if ok, why := CheckClockRead(p, *r, str(ns(now.Add(5*time.Millisecond+7))), span, true); ok || !strings.Contains(why, "the application cuts its value") {
-		t.Errorf("a cut epoch in nanoseconds, a replay value no whole microsecond: %v (%s); want refused naming the cut", ok, why)
+	if r := textClockRead(ns(sec), ns(sec.Add(FullRoundLead+7*time.Millisecond))); r == nil || r.Res != time.Millisecond {
+		t.Fatalf("a cut epoch in nanoseconds: %+v; want a Res of the 1ms cut", r)
+	} else {
+		check("a cut epoch in nanoseconds, a replay value no whole microsecond", *r, ns(now.Add(5*time.Millisecond+7)), true, "")
+		check("a cut epoch in nanoseconds, a replay value cut so", *r, ns(now.Add(5*time.Millisecond)), true, "")
 	}
 	const tp = "body.at.$date.$numberLong"
 	typed := func(at time.Time) Leaf { return InstantLeaf(tp, "body.at", at, time.Millisecond) }
 	whole := time.Date(2026, 10, 26, 9, 0, 0, 0, time.UTC)
 	ln := ClassifyIn(clockedDrifts(), []string{tp}, Shape{Leaves: map[string]Leaf{tp: typed(whole.Add(61 * time.Second))}}, Shape{Leaves: map[string]Leaf{tp: typed(whole)}}, whole.Add(time.Millisecond), nil, nil, nil, nil)[0]
-	if o, ok := ln.Clock(); !ok || o.Res != time.Second {
-		t.Fatalf("a cut $date: %s %+v,%v (%s); want a read at the second's cut", ln.Kind, o, ok, ln.Why)
-	} else if ok, why := CheckClockRead("at", o, typed(now.Add(5*time.Millisecond)), span, true); ok || !strings.Contains(why, "the application cuts its value") {
-		t.Errorf("a cut $date, a replay value no whole second: %v (%s); want refused naming the cut", ok, why)
+	if ln.Kind != KindClockRead || ln.Read == nil || ln.Read.Res != time.Second {
+		t.Errorf("a cut $date: %s Read=%+v (%s); want learned at the 1s cut", ln.Kind, ln.Read, ln.Why)
 	}
+}
+
+// clockWriters are the ways applications write a read of their clock as a
+// text or a number, each from the clock its runtime reads (the resolution
+// it truncates a read to), as recorded, in record's full round and at a
+// replay alike.
+var clockWriters = []struct {
+	name string
+	// cut is the cut the application makes coarser than a millisecond
+	// (to the second, to 10 ms), which the learn step learns at every
+	// recording, and a replay checks a value at; 0 for none.
+	cut time.Duration
+	// chance: the two values of some recordings are whole microseconds by
+	// chance, a cut a replay reads by its own value.
+	chance bool
+	// msClock: a clock of milliseconds written with six or nine fixed
+	// digits, whose two values both fall on a whole 10 ms by chance in about
+	// one recording in a hundred where F's read moved against the
+	// recording's as the row moves it (up to 200 ms; none of a fast call:
+	// TestAFastCallsTwoValuesNeverFallOnACutByChance): learned at that cut.
+	msClock bool
+	// limit: a cut of 10 or 100 ms written at a resolution less than 1,000
+	// times finer (milliseconds), which the learn step cannot tell from a
+	// writer of milliseconds: a stated limit, whose verdict may turn on
+	// where its read fell. The row asserts only that no moved value passes.
+	limit bool
+	w     func(t time.Time) string
+}{
+	{name: "Go RFC3339Nano, a clock of nanoseconds", w: func(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }},
+	{name: "Java Instant.toString, a clock of microseconds", w: func(t time.Time) string { return javaInstant(t.Truncate(time.Microsecond)) }},
+	{name: "Java Instant.toString, a clock of nanoseconds", w: javaInstant},
+	{name: "Python json.dumps(time.time())", chance: true, w: pythonFloat},
+	{name: ".NET trimmed ticks (FFFFFFF)", chance: true, w: func(t time.Time) string { return t.Truncate(100).UTC().Format("2006-01-02T15:04:05.9999999Z07:00") }},
+	{name: `.NET DateTime.ToString("o"), seven digits`, chance: true, w: func(t time.Time) string { return t.Truncate(100).UTC().Format("2006-01-02T15:04:05.0000000Z07:00") }},
+	{name: "Jackson's numeric Instant, JDK 9-14 (a clock of microseconds)", w: func(t time.Time) string { return jacksonInstant(t.Truncate(time.Microsecond)) }},
+	{name: "Jackson's numeric Instant, JDK 8 (a clock of milliseconds)", msClock: true, w: func(t time.Time) string { return jacksonInstant(t.Truncate(time.Millisecond)) }},
+	{name: "nine digits, a clock of microseconds", w: func(t time.Time) string {
+		return t.Truncate(time.Microsecond).UTC().Format("2006-01-02T15:04:05.000000000Z07:00")
+	}},
+	{name: "nine digits, a clock of milliseconds", msClock: true, w: func(t time.Time) string {
+		return t.Truncate(time.Millisecond).UTC().Format("2006-01-02T15:04:05.000000000Z07:00")
+	}},
+	{name: "JavaScript Date.now()/1000", w: func(t time.Time) string {
+		return strconv.FormatFloat(float64(t.UnixMilli())/1000, 'f', -1, 64)
+	}},
+	{name: "JavaScript toISOString", w: func(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05.000Z07:00") }},
+	{name: "epoch seconds", w: func(t time.Time) string { return strconv.FormatInt(t.Unix(), 10) }},
+	{name: "RFC 3339 to the second", w: func(t time.Time) string { return t.UTC().Format(time.RFC3339) }},
+	{name: "nine digits, cut to the second", cut: time.Second, w: func(t time.Time) string {
+		return t.Truncate(time.Second).UTC().Format("2006-01-02T15:04:05.000000000Z07:00")
+	}},
+	{name: "three digits, cut to the second", cut: time.Second, w: func(t time.Time) string { return t.Truncate(time.Second).UTC().Format("2006-01-02T15:04:05.000Z07:00") }},
+	{name: "Jackson's numeric Instant, cut to the second", cut: time.Second, w: func(t time.Time) string { return jacksonInstant(t.Truncate(time.Second)) }},
+	{name: "Python datetime.now().replace(microsecond=0).timestamp()", cut: time.Second, w: func(t time.Time) string { return pythonFloat(t.Truncate(time.Second)) }},
+	{name: "nine digits over a column of two fraction digits (cut to 10 ms)", cut: 10 * time.Millisecond, w: func(t time.Time) string {
+		return t.Truncate(10 * time.Millisecond).UTC().Format("2006-01-02T15:04:05.000000000Z07:00")
+	}},
+	{name: "Python isoformat over a column of two fraction digits (cut to 10 ms)", cut: 10 * time.Millisecond, w: func(t time.Time) string { return pythonIsoformat(t.Truncate(10 * time.Millisecond)) }},
+	{name: "Python isoformat over a column of one fraction digit (cut to 100 ms)", cut: 100 * time.Millisecond, w: func(t time.Time) string { return pythonIsoformat(t.Truncate(100 * time.Millisecond)) }},
+	{name: `.NET DateTime.ToString("o") over a column of two fraction digits (cut to 10 ms)`, cut: 10 * time.Millisecond, w: func(t time.Time) string {
+		return t.Truncate(10 * time.Millisecond).UTC().Format("2006-01-02T15:04:05.0000000Z07:00")
+	}},
+	{name: "six digits over a column of four fraction digits (cut to 100 µs)", w: func(t time.Time) string {
+		return t.Truncate(100 * time.Microsecond).UTC().Format("2006-01-02T15:04:05.000000Z07:00")
+	}},
+	{name: "three digits over a column of two fraction digits (cut to 10 ms)", limit: true, w: func(t time.Time) string {
+		return t.Truncate(10 * time.Millisecond).UTC().Format("2006-01-02T15:04:05.000Z07:00")
+	}},
+}
+
+// pythonIsoformat is Python's datetime.isoformat of an aware UTC datetime:
+// six fraction digits, none on a whole second.
+func pythonIsoformat(t time.Time) string {
+	t = t.Truncate(time.Microsecond).UTC()
+	if t.Nanosecond() == 0 {
+		return t.Format("2006-01-02T15:04:05+00:00")
+	}
+	return t.Format("2006-01-02T15:04:05.000000+00:00")
+}
+
+// javaInstant is Java's Instant.toString: a fraction in groups of three
+// digits, as few as the value needs.
+func javaInstant(t time.Time) string {
+	ns, base := t.Nanosecond(), t.UTC().Format("2006-01-02T15:04:05")
+	switch {
+	case ns == 0:
+		return base + "Z"
+	case ns%1e6 == 0:
+		return base + fmt.Sprintf(".%03dZ", ns/1e6)
+	case ns%1e3 == 0:
+		return base + fmt.Sprintf(".%06dZ", ns/1e3)
+	}
+	return base + fmt.Sprintf(".%09dZ", ns)
+}
+
+// pythonFloat is an epoch in seconds as the shortest decimal that reads
+// back as its float64 (Python's repr, JavaScript's Number toString), with
+// ".0" on a whole second, as Python writes it.
+func pythonFloat(t time.Time) string {
+	s := strconv.FormatFloat(float64(t.UnixNano())/1e9, 'f', -1, 64)
+	if t.Nanosecond() == 0 {
+		s = strconv.FormatInt(t.Unix(), 10)
+	}
+	if !strings.Contains(s, ".") {
+		s += ".0"
+	}
+	return s
+}
+
+// jacksonInstant is Jackson's numeric Instant (WRITE_DATES_AS_TIMESTAMPS
+// with WRITE_DATE_TIMESTAMPS_AS_NANOSECONDS): seconds, and nine digits.
+func jacksonInstant(t time.Time) string { return fmt.Sprintf("%d.%09d", t.Unix(), t.Nanosecond()) }
+
+// A replay's verdict on a plain read of the clock never turns on where the
+// replay's own read fell: for each writer, 1,000 recordings (their two
+// values one lead apart, at times a seeded generator picks) are learned as
+// record's learn step learns them (ClassifyIn, no call window), and each
+// one learned is replayed five times with the same writer's value of a read
+// in the replay's span. Every writer that does not cut its value coarser
+// than a millisecond passes every replay: a Python float epoch and .NET's
+// trimmed and fixed ticks, whose two values are both whole microseconds in
+// a few recordings in a hundred (the row counts them), are checked at the
+// replay's own value (a value that shows no cut at its own resolution, one
+// that shows a cut of a microsecond at it); Jackson's nine digits from a
+// clock of microseconds or milliseconds, which shows that cut in every
+// value, at the cut. A value cut coarser than a millisecond (to the second,
+// or to 10 or 100 ms written with six, seven or nine digits) is learned at
+// every recording at no finer than its cut, and passes every replay
+// (founder decision, 2026-10-27: checked at the cut), Python's isoformat
+// over a column of tenths learned at the second where both learned values
+// had no fraction among them. No recording of any writer is refused at
+// learn, and no replay's verdict flips. A writer of milliseconds with nine
+// fixed digits has both values on a whole 10 ms in about one recording in
+// a hundred, learned at that cut. A value moved a second either way, or
+// 50 ms, beyond the cut it was learned at (a writer's cut, or a coarser one
+// both learned values fell on by chance: a column of 10 ms whose two
+// values were whole tenths), is refused at every replay, but where
+// its own form is coarse enough to reach the span (a writer that drops
+// trailing zeros wrote a whole second or tenth: the exception of
+// 2026-10-27, it stands for its whole second or tenth). A cut of 10 ms
+// written in milliseconds (a stated limit) passes no moved value either.
+func TestAPlainClockReadsVerdictIsTheSameAtEveryReplayWhateverItsWriter(t *testing.T) {
+	const recordings, replays = 1000, 5
+	p := "body.at"
+	str := func(v string) Leaf { return Leaf{Path: p, Noise: p, Type: String, Value: v} }
+	shape := func(v string) Shape { return Shape{Leaves: map[string]Leaf{p: str(v)}} }
+	base := time.Date(2026, 10, 27, 3, 0, 0, 0, time.UTC)
+	for _, wr := range clockWriters {
+		rng := rand.New(rand.NewSource(37))
+		var passed, refused, coarse, movedPassed, byChance int
+		var ex []string
+		for i := 0; i < recordings; i++ {
+			t0 := base.Add(time.Duration(rng.Int63n(int64(24 * time.Hour))))
+			t1 := t0.Add(FullRoundLead + time.Duration(rng.Int63n(int64(200*time.Millisecond))))
+			rec, live := wr.w(t0), wr.w(t1)
+			ln := ClassifyIn(clockedDrifts(), []string{p}, shape(live), shape(rec), t0.Add(time.Millisecond), nil, nil, nil, nil)[0]
+			r := textClockRead(rec, live)
+			if r == nil {
+				t.Fatalf("%s: %s then %s read as no clock read", wr.name, rec, live)
+			}
+			o, ok := ln.Clock()
+			if !plainRead(ln) || !ok || o.Res != r.Res {
+				t.Fatalf("%s: %s then %s: %s Read=%+v (%s); want a plain read of the clock at %v, never refused at learn", wr.name, rec, live, ln.Kind, ln.Read, ln.Why, r.Res)
+			}
+			// Learned at no finer than the writer's cut, and, above the
+			// finer of the two encodings, only at a cut both values show.
+			rt, rres, _ := readClockText(rec)
+			lt, lres, _ := readClockText(live)
+			enc := min(rres, lres)
+			if o.Res < wr.cut || o.Res > enc && (rt.UnixNano()%int64(o.Res) != 0 || lt.UnixNano()%int64(o.Res) != 0) {
+				t.Fatalf("%s: %s then %s learned at %v; want a cut both values show, of at least %v", wr.name, rec, live, o.Res, wr.cut)
+			}
+			if wr.cut == 0 && o.Res > enc && o.Res > time.Millisecond {
+				coarse++
+			}
+			if o.Res >= time.Microsecond {
+				byChance++
+			}
+			for j := 0; j < replays; j++ {
+				now := base.Add(48*time.Hour + time.Duration(rng.Int63n(int64(24*time.Hour))))
+				span := Span{From: now, To: now.Add(20 * time.Millisecond)}
+				v := wr.w(now.Add(time.Duration(rng.Int63n(int64(20 * time.Millisecond)))))
+				ok, why := CheckClockRead(p, o, str(v), span, true)
+				if ClockReadHolds(o, str(v), span) != ok {
+					t.Fatalf("%s: ClockReadHolds and CheckClockRead disagree on %s (Res %v), replay %s", wr.name, rec, o.Res, v)
+				}
+				if ok {
+					passed++
+				} else {
+					refused++
+					if len(ex) < 3 {
+						ex = append(ex, fmt.Sprintf("%s then %s (Res %v), replay %s: %s", rec, live, o.Res, v, why))
+					}
+				}
+				// Moved by more than two of the cut it was learned at (a
+				// writer's cut, or a coarser one both learned values fell
+				// on): a value passes only within one of the resolution it
+				// is checked at of the span, either side, which is no
+				// coarser than the coarser of o.Res and its own form's (a
+				// writer that drops trailing zeros writes .7 for .700).
+				for _, d := range []time.Duration{-2*o.Res - time.Second, -2*o.Res - 50*time.Millisecond, 2*o.Res + 50*time.Millisecond + 20*time.Millisecond, 2*o.Res + time.Second + 20*time.Millisecond} {
+					mv := wr.w(now.Add(d + time.Duration(rng.Int63n(int64(20*time.Millisecond)))))
+					at, res, _ := readClockText(mv)
+					r := max(res, o.Res)
+					if ok, _ := CheckClockRead(p, o, str(mv), span, true); ok && (at.Before(span.From.Truncate(r).Add(-r)) || at.After(span.To.Add(r))) {
+						movedPassed++
+						if len(ex) < 3 {
+							ex = append(ex, fmt.Sprintf("%s then %s (Res %v), a value moved %v, %s, passed", rec, live, o.Res, d, mv))
+						}
+					}
+				}
+			}
+		}
+		switch {
+		case movedPassed != 0:
+			t.Errorf("%s: %d moved values passed; want none: %q", wr.name, movedPassed, ex)
+		case wr.limit:
+		case refused != 0 || passed != recordings*replays:
+			t.Errorf("%s: %d of %d replays refused; want none: %q", wr.name, refused, passed+refused, ex)
+		case wr.msClock && (coarse == 0 || coarse > recordings/25):
+			t.Errorf("%s: %d of %d recordings learned at a cut coarser than a millisecond; want about one in a hundred (both values on a whole 10 ms)", wr.name, coarse, recordings)
+		case wr.cut == 0 && !wr.msClock && coarse != 0:
+			t.Errorf("%s: %d of %d recordings learned at a cut coarser than a millisecond; want none", wr.name, coarse, recordings)
+		case wr.chance && byChance == 0:
+			t.Errorf("%s: no recording's two values fell on a unit by chance; the row drives no such read", wr.name)
+		}
+	}
+}
+
+// Two values of a writer that does not cut its value can both fall on a
+// step above their encoding by chance, where F's read moved against the
+// recording's by about half a second or more (FullRoundLead): a writer of
+// seconds on a whole minute, of minutes on a whole hour, of milliseconds on
+// a whole second. The learn step learns each such recording at the cut
+// both values show, and a replay checks a value at the cut its own value
+// shows (founder decision, 2026-10-27), so every replay of it passes, its
+// value on the step or not, and one a cut and a unit stale is refused; a
+// recording whose values show no such cut is learned at its encoding, and
+// every replay of it passes the same: no verdict turns on a replay's own
+// read. A time of day its protocol types, cut to the second, is learned at
+// the cut the same.
+func TestAChanceCutIsOneVerdictPerRecordingNeverPerReplay(t *testing.T) {
+	const p = "body.at"
+	str := func(v string) Leaf { return Leaf{Path: p, Noise: p, Type: String, Value: v} }
+	shape := func(l Leaf) Shape { return Shape{Leaves: map[string]Leaf{p: l}} }
+	t0 := time.Date(2026, 10, 27, 3, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 10, 28, 7, 0, 0, 0, time.UTC)
+	for _, f := range []struct {
+		name     string
+		w        func(time.Time) string
+		enc, cut time.Duration
+	}{
+		{"epoch seconds", func(t time.Time) string { return strconv.FormatInt(t.Unix(), 10) }, time.Second, time.Minute},
+		{"RFC 3339 to the second", func(t time.Time) string { return t.UTC().Format(time.RFC3339) }, time.Second, time.Minute},
+		{"an HTTP date", func(t time.Time) string { return t.UTC().Format(http.TimeFormat) }, time.Second, time.Minute},
+		{"a time of day to the second", func(t time.Time) string { return t.UTC().Format("15:04:05") }, time.Second, time.Minute},
+		{"an ISO date and time to the minute", func(t time.Time) string { return t.UTC().Format("2006-01-02T15:04Z07:00") }, time.Minute, time.Hour},
+		{"epoch milliseconds", func(t time.Time) string { return strconv.FormatInt(t.UnixMilli(), 10) }, time.Millisecond, time.Second},
+		{"JavaScript toISOString", func(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05.000Z07:00") }, time.Millisecond, time.Second},
+	} {
+		at := func(units int64) time.Time { return t0.Add(time.Duration(units) * f.enc) }
+		per := int64(f.cut / f.enc)
+		learn := func(r, l time.Time) Learned {
+			return ClassifyIn(clockedDrifts(), []string{p}, shape(str(f.w(l))), shape(str(f.w(r))), r.Add(f.enc), nil, nil, nil, nil)[0]
+		}
+		// Both on the cut: learned at it. One off it: learned at the
+		// encoding. Either way every replay passes, on the step or off it,
+		// and a value a cut and a unit before its span is refused.
+		for _, c := range []struct {
+			what string
+			ln   Learned
+			res  time.Duration
+		}{
+			{"both values on a whole " + f.cut.String(), learn(at(30*per), at(32*per)), f.cut},
+			{"one value off a whole " + f.cut.String(), learn(at(30*per), at(31*per+2)), f.enc},
+		} {
+			o, ok := c.ln.Clock()
+			if !plainRead(c.ln) || !ok || o.Res != c.res {
+				t.Errorf("%s, %s: %s Read=%+v (%s); want a plain read at %v", f.name, c.what, c.ln.Kind, c.ln.Read, c.ln.Why, c.res)
+				continue
+			}
+			for k := int64(0); k < 3*per && k < 5000; k++ {
+				v := now.Add(time.Duration(k) * f.enc)
+				span := Span{From: v.Add(-f.enc / 2), To: v.Add(f.enc / 2), Zone: time.UTC, Own: true}
+				if ok, why := CheckClockRead(p, o, str(f.w(v)), span, true); !ok {
+					t.Errorf("%s, %s, replay %s: refused (%s); want every replay passed", f.name, c.what, f.w(v), why)
+					break
+				}
+				if ok, _ := CheckClockRead(p, o, str(f.w(v.Add(-2*c.res-f.enc))), span, true); ok {
+					t.Errorf("%s, %s, replay %s, two cuts and a unit stale: passed; want refused", f.name, c.what, f.w(v.Add(-2*c.res-f.enc)))
+					break
+				}
+			}
+		}
+	}
+	// A time of day its protocol types (a Postgres time of microseconds),
+	// cut to the second in both runs: learned at the cut; one that is no
+	// whole second at its microsecond.
+	const tp = "args.0"
+	tod := func(at time.Time) Leaf { return TimeOfDayLeaf(tp, tp, time.Duration(clockOfDay(at)), time.Microsecond) }
+	read := time.Date(2026, 10, 22, 11, 59, 30, 0, time.UTC)
+	call := read.Add(115 * time.Millisecond)
+	if ln := classifyZoned(nil, false, tp, tod(read), tod(read.Add(FullRoundLead).Truncate(time.Second)), call, nil); !todRead(ln, "") || ln.Read.Res != time.Second {
+		t.Errorf("a typed time of day cut to the second: %s Read=%+v (%s); want a read modulo a day at the 1s cut", ln.Kind, ln.Read, ln.Why)
+	}
+	if ln := classifyZoned(nil, false, tp, tod(read.Add(37123*time.Microsecond)), tod(read.Add(FullRoundLead+37123*time.Microsecond)), call, nil); !todRead(ln, "") || ln.Read.Res != time.Microsecond {
+		t.Errorf("a typed time of day of microseconds: %s Read=%+v (%s); want a read modulo a day at 1µs", ln.Kind, ln.Read, ln.Why)
+	}
+}
+
+// A read of the clock the application cuts coarser than a millisecond is
+// learned at its cut and checked at it (founder decision, 2026-10-27): a
+// replay value of it stands for its whole cut, so it passes where its cut
+// meets the call's span (the span widened by one cut before it, the value
+// floored at the cut) and is refused otherwise. For a cut of 10 ms (nine
+// digits), 100 ms (six digits), a second (a $date), a minute (RFC 3339 to
+// the second) and a day (a midnight to the second), with a span starting a
+// unit past a whole cut: the cut the span starts in passes and the one
+// before, one cut and a unit before the span, is refused; the cut the span
+// ends in passes and the next is refused. Over 2,000 replays whose reads
+// fall anywhere in spans anywhere in a day, every value read in its span
+// passes (no verdict turns on where the read fell) and every value read
+// more than one cut before its span, or after it, is refused.
+func TestACoarseCutIsCheckedAtTheCut(t *testing.T) {
+	const tp = "body.at.$date.$numberLong"
+	text := func(lay string, c time.Duration) func(time.Time) Leaf {
+		return func(at time.Time) Leaf {
+			return Leaf{Path: "body.at", Noise: "body.at", Type: String, Value: at.Truncate(c).UTC().Format(lay)}
+		}
+	}
+	for _, f := range []struct {
+		name     string
+		path     string
+		cut, enc time.Duration
+		w        func(time.Time) Leaf
+		// u writes a value in w's form, cut to its encoding alone.
+		u func(time.Time) Leaf
+	}{
+		{"nine digits cut to 10ms", "body.at", 10 * time.Millisecond, time.Nanosecond, text("2006-01-02T15:04:05.000000000Z07:00", 10*time.Millisecond), text("2006-01-02T15:04:05.000000000Z07:00", time.Nanosecond)},
+		{"six digits cut to 100ms", "body.at", 100 * time.Millisecond, time.Microsecond, text("2006-01-02T15:04:05.000000Z07:00", 100*time.Millisecond), text("2006-01-02T15:04:05.000000Z07:00", time.Microsecond)},
+		{"a $date cut to the second", tp, time.Second, time.Millisecond, func(at time.Time) Leaf { return InstantLeaf(tp, "body.at", at.Truncate(time.Second), time.Millisecond) }, func(at time.Time) Leaf { return InstantLeaf(tp, "body.at", at, time.Millisecond) }},
+		{"RFC 3339 cut to the minute", "body.at", time.Minute, time.Second, text(time.RFC3339, time.Minute), text(time.RFC3339, time.Second)},
+		{"a midnight to the second (a date)", "body.at", 24 * time.Hour, time.Second, text(time.RFC3339, 24*time.Hour), text(time.RFC3339, time.Second)},
+	} {
+		shape := func(l Leaf) Shape { return Shape{Leaves: map[string]Leaf{f.path: l}} }
+		rec := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC).Add(f.cut * 7)
+		live := rec.Add(3 * f.cut)
+		ln := ClassifyIn(clockedDrifts(), []string{f.path}, shape(f.w(live)), shape(f.w(rec)), rec.Add(f.enc), nil, nil, nil, nil)[0]
+		o, ok := ln.Clock()
+		if !plainRead(ln) || !ok || o.Res != f.cut {
+			t.Errorf("%s: %s Read=%+v (%s); want a plain read of the clock learned at its %v cut", f.name, ln.Kind, ln.Read, ln.Why, f.cut)
+			continue
+		}
+		check := func(what string, at time.Time, s Span, want bool) {
+			t.Helper()
+			ok, why := CheckClockRead(f.path, o, f.w(at), s, true)
+			if ok != want || ClockReadHolds(o, f.w(at), s) != ok || !ok && !strings.Contains(why, "it changed") {
+				t.Errorf("%s, %s (%s, span %s to %s): %v (%s); want %v", f.name, what, f.w(at).Value, s.From.Format(time.RFC3339Nano), s.To.Format(time.RFC3339Nano), ok, why, want)
+			}
+		}
+		k := time.Date(2026, 10, 28, 0, 0, 0, 0, time.UTC).Add(5 * f.cut)
+		span := Span{From: k.Add(f.enc), To: k.Add(f.cut + f.cut/2), Zone: time.UTC, Own: true}
+		check("the cut the span starts in", k, span, true)
+		check("one cut stale", k.Add(-f.cut), span, true)
+		check("two cuts stale", k.Add(-2*f.cut), span, false)
+		check("the cut the span ends in", k.Add(f.cut), span, true)
+		check("one cut past the cut the span ends in (a writer that rounds)", k.Add(2*f.cut), span, true)
+		check("two cuts past it", k.Add(3*f.cut), span, false)
+		unit := func(what string, at time.Time, want bool) {
+			t.Helper()
+			l := f.u(at)
+			if ok, why := CheckClockRead(f.path, o, l, span, true); ok != want {
+				t.Errorf("%s, %s (%s): %v (%s); want %v", f.name, what, l.Value, ok, why, want)
+			}
+		}
+		// A value one unit of its encoding past the widened span shows no
+		// cut, so it is checked at its own resolution, and fails.
+		unit("one cut and a unit stale", k.Add(-f.cut-f.enc), false)
+		unit("one unit past the widened span", span.To.Add(f.cut).Truncate(f.enc).Add(f.enc), false)
+		rng := rand.New(rand.NewSource(41))
+		for i := 0; i < 2000; i++ {
+			from := k.Add(time.Duration(rng.Int63n(int64(24 * time.Hour))))
+			s := Span{From: from, To: from.Add(time.Duration(rng.Int63n(int64(f.cut)))), Zone: time.UTC, Own: true}
+			read := s.From.Add(time.Duration(rng.Int63n(int64(s.To.Sub(s.From)) + 1)))
+			check("a read in its span", read, s, true)
+			check("a read in its span, rounded up", read.Truncate(f.cut).Add(f.cut), s, true)
+			check("a read one cut before its span", s.From.Add(-f.cut), s, true)
+			check("a read more than one cut before the cut its span starts in", s.From.Truncate(f.cut).Add(-f.cut-time.Duration(1+rng.Int63n(int64(f.cut)))), s, false)
+			check("a value more than one cut after its span", s.To.Add(f.cut).Truncate(f.cut).Add(f.cut+time.Duration(rng.Int63n(int64(f.cut)))), s, false)
+		}
+	}
+}
+
+// A cut is read in UTC, in the offset a value writes, and in the
+// application's zone, at learn and at replay, so an hour or a day the
+// application cuts in a zone whose offset is no whole number of it is
+// learned and checked as that hour or day (founder decision, 2026-10-27,
+// and the coordinator's ruling of 23:44): a text that writes +05:30 or
+// -03:30 cut to its hour, one that writes +02:00 cut to its day, a typed
+// $date cut to the IST hour, a "Z" text cut to the IST day, and a $date
+// cut to Berlin's day across the 25 hours of 2026-10-25, when its clocks go
+// back (a day of the zone's calendar, never 24 hours). Read in UTC alone,
+// each shows a finer cut (a minute, an hour) and a replay flipped by when
+// in the hour or the day it ran. Writers that round rather than cut
+// (JavaScript's Math.round(Date.now()/1000) as a JSON number, a value
+// rounded to the second written with three fraction digits, a time of day
+// rounded so, read on the day after the one the span ends on where it is
+// ahead of the span's end) pass, one cut ahead of the span. Over 2,000 replays each, every value a read in its
+// span writes passes, and one two cuts stale or two cuts past the span is
+// refused: no verdict turns on when the replay ran.
+func TestACutIsReadInTheZoneTheApplicationCutsIn(t *testing.T) {
+	const tp = "body.at.$date.$numberLong"
+	ist, err := time.LoadLocation("Asia/Kolkata")
+	if err != nil {
+		ist = time.FixedZone("IST", 5*3600+1800)
+	}
+	berlin, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Skipf("no zone data: %v", err)
+	}
+	plus2, nf := time.FixedZone("", 2*3600), time.FixedZone("", -(3*3600+1800))
+	hour := func(loc *time.Location) func(time.Time) time.Time {
+		return func(t time.Time) time.Time {
+			l := t.In(loc)
+			return time.Date(l.Year(), l.Month(), l.Day(), l.Hour(), 0, 0, 0, loc)
+		}
+	}
+	day := func(loc *time.Location) func(time.Time) time.Time {
+		return func(t time.Time) time.Time {
+			l := t.In(loc)
+			return time.Date(l.Year(), l.Month(), l.Day(), 0, 0, 0, 0, loc)
+		}
+	}
+	zone := func(name string) *time.Location {
+		loc, err := time.LoadLocation(name)
+		if err != nil {
+			t.Skipf("no zone data for %s: %v", name, err)
+		}
+		return loc
+	}
+	// first is the first instant at or before t whose wall clock in loc
+	// shows the same key (its date, or its date and hour), found by a walk
+	// back a minute at a time: the start of a day or an hour whose clocks
+	// skipped it.
+	first := func(loc *time.Location, key func(time.Time) string) func(time.Time) time.Time {
+		return func(t time.Time) time.Time {
+			t = t.Truncate(time.Minute)
+			for k := key(t); key(t.Add(-time.Minute)) == k; {
+				t = t.Add(-time.Minute)
+			}
+			return t
+		}
+	}
+	dayStart := func(loc *time.Location) func(time.Time) time.Time {
+		return first(loc, func(t time.Time) string { return t.In(loc).Format("2006-01-02") })
+	}
+	hourStart := func(loc *time.Location) func(time.Time) time.Time {
+		return first(loc, func(t time.Time) string { return t.In(loc).Format("2006-01-02T15") })
+	}
+	round := func(c time.Duration) func(time.Time) time.Time {
+		return func(t time.Time) time.Time { return t.Round(c) }
+	}
+	text := func(loc *time.Location, lay string) func(time.Time) Leaf {
+		return func(at time.Time) Leaf {
+			return Leaf{Path: "body.at", Noise: "body.at", Type: String, Value: at.In(loc).Format(lay)}
+		}
+	}
+	typed := func(at time.Time) Leaf { return InstantLeaf(tp, "body.at", at, time.Millisecond) }
+	for _, f := range []struct {
+		name, path string
+		app        *time.Location
+		cut        time.Duration
+		days       int
+		// cutOf is the value the application writes for a read at t,
+		// leaf the leaf that writes it.
+		cutOf func(time.Time) time.Time
+		leaf  func(time.Time) Leaf
+	}{
+		{"a +05:30 text cut to its hour", "body.at", nil, time.Hour, 0, hour(ist), text(ist, time.RFC3339)},
+		{"a -03:30 text cut to its hour", "body.at", nil, time.Hour, 0, hour(nf), text(nf, time.RFC3339)},
+		{"a +02:00 text cut to its day", "body.at", nil, 24 * time.Hour, 1, day(plus2), text(plus2, time.RFC3339)},
+		{"a typed $date cut to the IST hour", tp, ist, time.Hour, 0, hour(ist), typed},
+		{"a Z text cut to the IST day", "body.at", ist, 24 * time.Hour, 1, day(ist), text(time.UTC, time.RFC3339)},
+		{"a typed $date cut to Berlin's day", tp, berlin, 24 * time.Hour, 1, day(berlin), typed},
+		// Days whose clocks skip midnight (summer time starts at 00:00):
+		// the day starts at 01:00, as Go, Java and JavaScript cut it.
+		{"a typed $date cut to Cairo's day", tp, zone("Africa/Cairo"), 24 * time.Hour, 1, dayStart(zone("Africa/Cairo")), typed},
+		{"a typed $date cut to Santiago's day", tp, zone("America/Santiago"), 24 * time.Hour, 1, dayStart(zone("America/Santiago")), typed},
+		{"a typed $date cut to Havana's day", tp, zone("America/Havana"), 24 * time.Hour, 1, dayStart(zone("America/Havana")), typed},
+		// Lord Howe's clocks skip 02:00-02:30 when summer time starts: that
+		// hour starts at 02:30.
+		{"a typed $date cut to Lord Howe's hour", tp, zone("Australia/Lord_Howe"), time.Hour, 0, hourStart(zone("Australia/Lord_Howe")), typed},
+		{"Math.round(Date.now()/1000)", "body.iat", nil, time.Second, 0, round(time.Second), func(at time.Time) Leaf {
+			return Leaf{Path: "body.iat", Noise: "body.iat", Type: Number, Value: strconv.FormatInt(at.Unix(), 10)}
+		}},
+		{"three digits rounded to the second", "body.at", nil, time.Second, 0, round(time.Second), text(time.UTC, "2006-01-02T15:04:05.000Z07:00")},
+		{"a time of day rounded to the second", "body.at", nil, time.Second, 0, round(time.Second), text(time.UTC, "15:04:05")},
+	} {
+		// shift is t moved by n cuts. Of an hour or a day, the start of the
+		// n-th one after (before) t's, as the application cuts it: days and
+		// hours of the zone's calendar, which may last 23 or 25 hours, or
+		// start after the hour its clocks skip.
+		shift := func(t time.Time, n int) time.Time {
+			if f.cut < time.Hour {
+				return t.Add(time.Duration(n) * f.cut)
+			}
+			step := f.cut + 1
+			if f.days > 0 {
+				step = 30 * time.Hour
+			}
+			for ; n < 0; n++ {
+				t = f.cutOf(f.cutOf(t).Add(-1))
+			}
+			for ; n > 0; n-- {
+				t = f.cutOf(f.cutOf(t).Add(step))
+			}
+			return t
+		}
+		shape := func(l Leaf) Shape { return Shape{Leaves: map[string]Leaf{f.path: l}} }
+		rec := time.Date(2026, 10, 20, 9, 47, 7, 600e6, time.UTC)
+		live := shift(rec, 3)
+		dc := clockedDrifts()
+		dc.zone = f.app
+		ln := ClassifyIn(dc, []string{f.path}, shape(f.leaf(f.cutOf(live))), shape(f.leaf(f.cutOf(rec))), rec.Add(time.Millisecond), nil, nil, nil, nil)[0]
+		o, ok := ln.Clock()
+		if !plainRead(ln) || !ok || o.Res != f.cut || o.Zone != "" && !models.LayoutTimeOfDay(o.Layout) {
+			t.Errorf("%s: %s Read=%+v (%s); want a plain read of the clock learned at its %v cut", f.name, ln.Kind, ln.Read, ln.Why, f.cut)
+			continue
+		}
+		bad := 0
+		check := func(what string, at time.Time, s Span, want bool) {
+			t.Helper()
+			if ok, why := CheckClockRead(f.path, o, f.leaf(at), s, true); ok != want && bad < 5 {
+				bad++
+				t.Errorf("%s, %s (%s, span %s to %s): %v (%s); want %v", f.name, what, f.leaf(at).Value, s.From.Format(time.RFC3339Nano), s.To.Format(time.RFC3339Nano), ok, why, want)
+			}
+		}
+		rng := rand.New(rand.NewSource(42))
+		base := time.Date(2026, 10, 21, 0, 0, 0, 0, time.UTC)
+		switch f.name {
+		case "a typed $date cut to Cairo's day":
+			base = time.Date(2026, 4, 19, 0, 0, 0, 0, time.UTC)
+		case "a typed $date cut to Santiago's day":
+			base = time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC)
+		case "a typed $date cut to Havana's day":
+			base = time.Date(2026, 3, 3, 0, 0, 0, 0, time.UTC)
+		case "a typed $date cut to Lord Howe's hour":
+			base = time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)
+		}
+		for i := 0; i < 2000; i++ {
+			from := base.Add(time.Duration(rng.Int63n(int64(min(10*24*time.Hour, 2000*f.cut)))))
+			s := Span{From: from, To: from.Add(time.Duration(rng.Int63n(int64(min(f.cut, 10*time.Minute))))), Zone: f.app, Own: true}
+			read := s.From.Add(time.Duration(rng.Int63n(int64(s.To.Sub(s.From)) + 1)))
+			check("a read in its span", f.cutOf(read), s, true)
+			check("one cut stale", shift(f.cutOf(read), -1), s, true)
+			// The start of the cut that holds the span's start, which a
+			// writer that rounds may write one cut later.
+			start := f.cutOf(s.From)
+			if start.After(s.From) {
+				start = shift(start, -1)
+			}
+			check("two cuts stale", shift(start, -2), s, false)
+			// An hour's window is one hour of instants past the span (the
+			// ruling); where a skipped half hour shortened a wall hour, the
+			// second wall hour after the span's may still lie in it.
+			past := shift(f.cutOf(s.To), 2)
+			for f.days == 0 && !past.After(s.To.Add(f.cut)) {
+				past = shift(past, 1)
+			}
+			check("two cuts past the span", past, s, false)
+		}
+		if f.name == "a typed $date cut to Lord Howe's hour" {
+			s := Span{From: time.Date(2026, 10, 4, 2, 50, 0, 0, f.app), Zone: f.app, Own: true}
+			s.To = s.From.Add(time.Minute)
+			check("the hour that starts at 02:30", f.cutOf(s.From), s, true)
+		}
+		if f.days > 0 && f.app == berlin && f.name == "a typed $date cut to Berlin's day" {
+			late := time.Date(2026, 10, 25, 23, 40, 0, 0, berlin)
+			s := Span{From: late, To: late.Add(time.Minute), Zone: berlin, Own: true}
+			check("the day the clocks go back, read late in it", f.cutOf(late), s, true)
+			check("the day before it", shift(f.cutOf(late), -1), s, true)
+			check("two days before it", shift(f.cutOf(late), -2), s, false)
+		}
+	}
+}
+
+// A wall clock of no zone writes its own zone's clock: its cut is read on
+// its digits (and where the application's zone skipped the start of their
+// hour or day), never on the instant they name read in another zone. Digits
+// of 18:30 in IST are a whole day in UTC: learned at the minute they show,
+// and a replay value of 05:30 (00:00 in UTC) is checked at its minute, so
+// one fourteen hours stale is refused, not passed as a day's cut.
+func TestAWallClocksCutIsReadOnItsDigits(t *testing.T) {
+	const p = "body.at"
+	ist := time.FixedZone("IST", 5*3600+1800)
+	wall := func(digits string) Leaf { return Leaf{Path: p, Noise: p, Type: String, Value: digits} }
+	call := time.Date(2026, 10, 20, 13, 0, 0, 5e6, time.UTC)
+	ln := classifyZoned(ist, false, p, wall("2026-10-20 18:30:00"), wall("2026-10-21 18:30:00"), call, nil)
+	if o, ok := ln.Clock(); !plainRead(ln) || !ok || o.Res != time.Minute {
+		t.Errorf("digits of 18:30 a day apart, the application in IST: %s Read=%+v (%s); want a plain read learned at the minute its digits show", ln.Kind, ln.Read, ln.Why)
+	}
+	o := models.ClockOffset{Res: 24 * time.Hour, Zone: models.ZoneApp, Layout: "iso-second-space"}
+	now := time.Date(2026, 10, 27, 20, 0, 0, 0, ist)
+	s := Span{From: now, To: now.Add(time.Minute), Zone: ist, Own: true}
+	if ok, why := CheckClockRead(p, o, wall("2026-10-27 05:30:00"), s, true); ok {
+		t.Errorf("a wall clock of 05:30 in IST (00:00 in UTC), read at 20:00: passed (%s); want checked at its minute and refused", why)
+	}
+	if ok, why := CheckClockRead(p, o, wall("2026-10-27 20:00:00"), s, true); !ok {
+		t.Errorf("a wall clock of 20:00 in IST, read at 20:00: refused (%s); want passed", why)
+	}
+}
+
+// fixedForm is a form of an instant that writes it at a fixed resolution
+// (res), whatever its value.
+type fixedForm struct {
+	name string
+	res  time.Duration
+	w    func(time.Time) string
+}
+
+// fixedForms are the forms of an instant that write it at a fixed
+// resolution, whatever its value: ISO 8601 at the hour, the minute, the
+// second and one to nine fraction digits, and epochs in seconds,
+// milliseconds, microseconds, nanoseconds and seconds with one to nine
+// fraction digits; then a BSON datetime (a millisecond) and a typed
+// microsecond (Postgres's timestamp), each with its encoding.
+func fixedForms() (text []fixedForm, typed []time.Duration) {
+	add := func(name string, res time.Duration, w func(time.Time) string) {
+		text = append(text, fixedForm{name, res, w})
+	}
+	add("ISO 8601 to the hour", time.Hour, func(t time.Time) string { return t.UTC().Format("2006-01-02T15Z07:00") })
+	add("ISO 8601 to the minute", time.Minute, func(t time.Time) string { return t.UTC().Format("2006-01-02T15:04Z07:00") })
+	add("ISO 8601 to the second", time.Second, func(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05Z07:00") })
+	for d := 1; d <= 9; d++ {
+		layout := "2006-01-02T15:04:05." + strings.Repeat("0", d) + "Z07:00"
+		res := time.Second / time.Duration(pow10(d))
+		add(fmt.Sprintf("ISO 8601 with %d fixed fraction digits", d), res, func(t time.Time) string { return t.UTC().Format(layout) })
+		add(fmt.Sprintf("epoch seconds with %d fixed fraction digits", d), res, func(t time.Time) string {
+			return fmt.Sprintf("%d.%0*d", t.Unix(), d, t.Nanosecond()/int(res))
+		})
+	}
+	add("epoch seconds", time.Second, func(t time.Time) string { return strconv.FormatInt(t.Unix(), 10) })
+	add("epoch milliseconds", time.Millisecond, func(t time.Time) string { return strconv.FormatInt(t.UnixMilli(), 10) })
+	add("epoch microseconds", time.Microsecond, func(t time.Time) string { return strconv.FormatInt(t.UnixMicro(), 10) })
+	add("epoch nanoseconds", time.Nanosecond, func(t time.Time) string { return strconv.FormatInt(t.UnixNano(), 10) })
+	return text, []time.Duration{time.Millisecond, time.Microsecond}
+}
+
+func pow10(d int) int64 {
+	n := int64(1)
+	for ; d > 0; d-- {
+		n *= 10
+	}
+	return n
+}
+
+// learnedAtACoarseCut reports whether the learn step learns the plain read
+// of the clock it reads from rec and live, written in form w (or typed at
+// encoding enc, where w is nil), at a cut coarser than a millisecond both
+// values show (readRes, textReadRes), above the finer of their encodings: a
+// looser check at replay (a value may stand up to one cut stale), which
+// FullRoundLead keeps a fast call's pair from by chance.
+func learnedAtACoarseCut(w func(time.Time) string, enc time.Duration, rec, live time.Time) (bool, string) {
+	coarse := func(res, enc time.Duration) bool { return res > enc && res > time.Millisecond }
+	if w == nil {
+		r, l := rec.Truncate(enc), live.Truncate(enc)
+		if r.Equal(l) {
+			return false, ""
+		}
+		return coarse(readRes(enc, sharedGrain(r, l)), enc), r.Format(time.RFC3339Nano) + " then " + l.Format(time.RFC3339Nano)
+	}
+	r, l := w(rec), w(live)
+	if r == l {
+		return false, ""
+	}
+	read := textClockRead(r, l)
+	if read == nil {
+		return false, r + " then " + l
+	}
+	_, rres, _ := readClockText(r)
+	_, lres, _ := readClockText(l)
+	return coarse(read.Res, min(rres, lres)), r + " then " + l
+}
+
+// leadClock is a clock an application reads, at its resolution: exact (the
+// grid's own instants), or one that cuts each read to a microsecond or a
+// millisecond before a form writes it.
+type leadClock struct {
+	name string
+	res  time.Duration
+}
+
+func leadClocks() []leadClock {
+	return []leadClock{{"an exact clock", time.Nanosecond}, {"a clock of microseconds", time.Microsecond}, {"a clock of milliseconds", time.Millisecond}}
+}
+
+// leadForm is a form (text, or typed at enc where w is nil) as one clock
+// writes it: res is the coarser of the clock's resolution and the form's,
+// the resolution its values carry.
+type leadForm struct {
+	name     string
+	w        func(time.Time) string
+	enc, res time.Duration
+}
+
+// leadForms are the forms a clock writes differently from an exact clock:
+// every form for the exact clock, and those finer than the clock's
+// resolution for the others. A form as fine as the clock or coarser writes
+// the clock's value of a read as it writes the exact clock's, cut to the
+// form's resolution, and the exact clock's rows take each read at both ends
+// of that cut.
+func leadForms(c leadClock) []leadForm {
+	text, typed := fixedForms()
+	var out []leadForm
+	for _, f := range text {
+		if c.res == time.Nanosecond || f.res < c.res {
+			out = append(out, leadForm{f.name, f.w, f.res, max(f.res, c.res)})
+		}
+	}
+	for _, enc := range typed {
+		if c.res == time.Nanosecond || enc < c.res {
+			out = append(out, leadForm{fmt.Sprintf("typed at %v", enc), nil, enc, max(enc, c.res)})
+		}
+	}
+	return out
+}
+
+// fastBand is how far F's read may move against the recording's, either
+// way, in a fast call whose values carry resolution r: 5 ms less r, since a
+// cut of each read to r moves the two values apart by up to r; for values of
+// 10 ms or coarser, whose nearest step is 355 ms or more off, 5 ms.
+func fastBand(r time.Duration) time.Duration {
+	if r >= 5*time.Millisecond {
+		return 5 * time.Millisecond
+	}
+	return 5*time.Millisecond - r
+}
+
+// stepLearns reports whether the learn step, by the ruled steps, learns two
+// values written at res (encoding enc) at a coarse cut: they differ and both
+// fall on one step above a millisecond the learn step reads a cut at, 10 ms
+// and 100 ms where the step is at least 1000 times the encoding, a second, a
+// minute, an hour and a day above the encoding at any ratio.
+func stepLearns(rec, live time.Time, enc, res time.Duration) bool {
+	r, l := rec.Truncate(res), live.Truncate(res)
+	if r.Equal(l) {
+		return false
+	}
+	for _, s := range []time.Duration{10 * time.Millisecond, 100 * time.Millisecond, time.Second, time.Minute, time.Hour, 24 * time.Hour} {
+		if s > enc && (s >= time.Second || s >= 1000*enc) && r.Truncate(s).Equal(r) && l.Truncate(s).Equal(l) {
+			return true
+		}
+	}
+	return false
+}
+
+// The lead record's full round runs at (FullRoundLead) is a whole number of
+// no step the learn step reads a cut at above a millisecond, so two values
+// of a writer that does not cut, read about as far into their calls in both
+// runs (a fast call), never both fall on such a step, and the learn step
+// never learns a fast call's pair at a cut by chance (a looser check). A fast call's full-round read
+// lies within 5 ms less r of the recording's, r being the resolution its
+// values carry, the clock's or the form's, the coarser (fastBand): 4 ms on a
+// clock of milliseconds, 4.99 ms for five fraction digits, 4.999 ms for six
+// or on a clock of microseconds. The first half takes recorded reads on a
+// millisecond grid across two seconds about midnight, off the grid by a
+// varying fraction of a millisecond, each at the first and the last instant
+// of the cut its values carry, on an exact clock and on clocks of
+// microseconds and milliseconds, in every form that writes a fixed
+// resolution: no pair is learned at a cut with F's read moved up to 5 ms less r
+// either way, and where a whole 10 ms is a step the learn step reads (an
+// encoding of 10 µs or finer), a read on a whole day is learned at it a
+// nanosecond further, so the band is exact. A lead that is a whole number
+// of 10 ms (61.5 s) learns such pairs of a millisecond clock written with
+// five to nine digits, in epoch micro- or nanoseconds or typed in
+// microseconds at 10 ms in one recording in twelve with F's read within 0.3 ms of
+// the recording's, and in one in 80 within 4 ms.
+//
+// The second half pins the bounds. From a recorded read on a whole day (so
+// on every step at once), at the first and the last instant its value
+// writes, F's read moves in half milliseconds out to 600 ms either way, and
+// a pair is learned at a cut exactly where the ruled steps put both values on one
+// (stepLearns): nothing short of 5 ms less r (a whole 10 ms), 45 ms back
+// or 55 ms on less r (100 ms), 455 ms on or 545 ms back less r (a second:
+// 355 ms on and 445 ms back for a writer of tenths), or 545 ms back for a
+// writer of seconds (a minute). The table at its end names those bounds,
+// to the half millisecond, for a form of each kind.
+func TestAFastCallsTwoValuesNeverFallOnACutByChance(t *testing.T) {
+	ms := time.Millisecond
+	midnight := time.Date(2026, 10, 28, 0, 0, 0, 0, time.UTC)
+	for _, c := range leadClocks() {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			for _, f := range leadForms(c) {
+				b := fastBand(f.res)
+				moves := []time.Duration{-b, -b / 2, 0, b / 2, b}
+				for i := -1000; i < 1000; i++ {
+					at := midnight.Add(time.Duration(i)*ms + time.Duration((int64(i)+1000)*373_211)%ms)
+					first := at.Truncate(f.res)
+					for _, rec := range []time.Time{first, first.Add(f.res - time.Nanosecond)} {
+						for _, j := range moves {
+							if refused, pair := learnedAtACoarseCut(f.w, f.enc, rec.Truncate(c.res), rec.Add(FullRoundLead+j).Truncate(c.res)); refused {
+								t.Fatalf("%s, %s, read at %s, F's read %v off the recording's: %s learned at a coarse cut; want no fast call's pair learned so within %v", c.name, f.name, rec.Format(time.RFC3339Nano), j, pair, b)
+							}
+						}
+					}
+				}
+				if 1000*f.enc > 10*ms || f.res >= 5*ms {
+					continue
+				}
+				for _, e := range []struct {
+					rec time.Time
+					j   time.Duration
+				}{{midnight, -b - time.Nanosecond}, {midnight.Add(f.res - time.Nanosecond), b + time.Nanosecond}} {
+					if refused, pair := learnedAtACoarseCut(f.w, f.enc, e.rec.Truncate(c.res), e.rec.Add(FullRoundLead+e.j).Truncate(c.res)); !refused {
+						t.Errorf("%s, %s, read at %s, F's read %v off the recording's: %s not learned at a coarse cut; want the band of %v exact, a whole 10 ms reached a nanosecond past it", c.name, f.name, e.rec.Format(time.RFC3339Nano), e.j, pair, b)
+					}
+				}
+			}
+		})
+	}
+	t.Run("the bounds", func(t *testing.T) {
+		// edge is the nearest move of F's read either way at which a pair
+		// is learned at a coarse cut (0: none out to 600 ms), and whether
+		// one is unmoved.
+		type edge struct {
+			on, back time.Duration
+			unmoved  bool
+		}
+		got := map[string]edge{}
+		var mu sync.Mutex
+		swept := 0
+		t.Run("swept", func(t *testing.T) {
+			for _, c := range leadClocks() {
+				for _, f := range leadForms(c) {
+					swept++
+					t.Run(c.name+", "+f.name, func(t *testing.T) {
+						t.Parallel()
+						var e edge
+						for _, p := range []time.Duration{0, f.res - time.Nanosecond} {
+							rec := midnight.Add(p)
+							for k := -1200; k <= 1200; k++ {
+								j := time.Duration(k) * ms / 2
+								live := rec.Add(FullRoundLead + j)
+								refused, pair := learnedAtACoarseCut(f.w, f.enc, rec.Truncate(c.res), live.Truncate(c.res))
+								if want := stepLearns(rec.Truncate(c.res), live.Truncate(c.res), f.enc, f.res); refused != want {
+									t.Fatalf("%s, %s, F's read %v off the recording's (%s): learned at a coarse cut %v; want %v, the ruled steps", c.name, f.name, j, pair, refused, want)
+								}
+								switch {
+								case !refused:
+								case j == 0:
+									e.unmoved = true
+								case j > 0 && (e.on == 0 || j < e.on):
+									e.on = j
+								case j < 0 && (e.back == 0 || j > e.back):
+									e.back = j
+								}
+							}
+						}
+						mu.Lock()
+						got[c.name+", "+f.name] = e
+						mu.Unlock()
+					})
+				}
+			}
+		})
+		for _, row := range []struct {
+			form string
+			want edge
+		}{
+			{"an exact clock, ISO 8601 with 9 fixed fraction digits", edge{on: 5 * ms, back: -5 * ms}},
+			{"a clock of microseconds, ISO 8601 with 9 fixed fraction digits", edge{on: 5 * ms, back: -5 * ms}},
+			{"a clock of milliseconds, ISO 8601 with 9 fixed fraction digits", edge{on: 4500 * time.Microsecond, back: -4500 * time.Microsecond}},
+			{"a clock of milliseconds, epoch nanoseconds", edge{on: 4500 * time.Microsecond, back: -4500 * time.Microsecond}},
+			{"a clock of milliseconds, typed at 1µs", edge{on: 4500 * time.Microsecond, back: -4500 * time.Microsecond}},
+			{"an exact clock, ISO 8601 with 6 fixed fraction digits", edge{on: 5 * ms, back: -5 * ms}},
+			{"an exact clock, ISO 8601 with 4 fixed fraction digits", edge{on: 55 * ms, back: -45 * ms}},
+			{"a clock of milliseconds, ISO 8601 with 4 fixed fraction digits", edge{on: 54500 * time.Microsecond, back: -44500 * time.Microsecond}},
+			{"an exact clock, ISO 8601 with 3 fixed fraction digits", edge{on: 454500 * time.Microsecond, back: -544500 * time.Microsecond}},
+			{"an exact clock, typed at 1ms", edge{on: 454500 * time.Microsecond, back: -544500 * time.Microsecond}},
+			{"an exact clock, ISO 8601 with 1 fixed fraction digits", edge{on: 355500 * time.Microsecond, back: -445500 * time.Microsecond}},
+			{"an exact clock, ISO 8601 to the second", edge{back: -545500 * time.Microsecond}},
+			{"an exact clock, epoch seconds", edge{back: -545500 * time.Microsecond}},
+			{"an exact clock, ISO 8601 to the minute", edge{}},
+		} {
+			e, ok := got[row.form]
+			if !ok && len(got) < swept {
+				continue // a -run filter left this form unswept
+			}
+			if !ok {
+				t.Errorf("%s: never swept; want a form and clock the sweep runs", row.form)
+				continue
+			}
+			if e != row.want {
+				t.Errorf("%s: the nearest moves of F's read learned at a coarse cut %v on and %v back, unmoved %v; want %v and %v, unmoved never", row.form, e.on, e.back, e.unmoved, row.want.on, row.want.back)
+			}
+		}
+	})
+}
+
+// Python's isoformat over a database column of one or two fraction digits
+// (a cut to 100 or 10 ms), whose two learned values both had no fraction
+// (the recording's read in the first cut of its second, and F's read about
+// 0.45 s on from the recording's against its call, so it fell there too),
+// is learned at the second its two forms write. A replay checks each value
+// at the cut it shows, no coarser than the second (founder decision,
+// 2026-10-27): a value with a fraction at the 100 or 10 ms it falls on, a
+// value on a whole second at the second, so every value read in its call's
+// span passes, wherever in its second the read fell; a value with a
+// fraction a cut stale, and a whole second's value a second stale (where
+// the replay's window starts at or after the whole second that follows it),
+// are refused as changed.
+func TestAnIsoformatTenthsColumnLearnedOnWholeSecondsPassesEveryReplayInItsSpan(t *testing.T) {
+	const p = "body.at"
+	ms := time.Millisecond
+	str := func(v string) Leaf { return Leaf{Path: p, Noise: p, Type: String, Value: v} }
+	shape := func(v string) Shape { return Shape{Leaves: map[string]Leaf{p: str(v)}} }
+	for _, col := range []struct {
+		cut  time.Duration
+		into time.Duration
+	}{{100 * ms, 50 * ms}, {10 * ms, 5 * ms}} {
+		w := func(t time.Time) string { return pythonIsoformat(t.Truncate(col.cut)) }
+		read := time.Date(2026, 10, 27, 9, 14, 7, int(col.into), time.UTC)
+		fread := read.Add(FullRoundLead + 450*ms)
+		rec, live := w(read), w(fread)
+		if rec != "2026-10-27T09:14:07+00:00" || live != "2026-10-27T09:15:09+00:00" {
+			t.Fatalf("a column cut to %v, the two values as written: %q then %q; want both on a whole second", col.cut, rec, live)
+		}
+		ln := ClassifyIn(clockedDrifts(), []string{p}, shape(live), shape(rec), read.Add(ms), nil, nil, nil, nil)[0]
+		o, ok := ln.Clock()
+		if !plainRead(ln) || !ok || o.Res != time.Second {
+			t.Fatalf("a column cut to %v, %s then %s: %s Read=%+v (%s); want a plain read of the clock at the second its forms write", col.cut, rec, live, ln.Kind, ln.Read, ln.Why)
+		}
+		now := time.Date(2026, 10, 29, 16, 40, 2, 0, time.UTC)
+		for _, row := range []struct {
+			name   string
+			at     time.Time
+			v      string
+			passes bool
+			names  string
+		}{
+			{"the replay's read in the first cut of its second", now.Add(col.cut * 4 / 10), "", true, ""},
+			{"the replay's read at .31 of its second", now.Add(310 * ms), "", true, ""},
+			{"the replay's read at .57 of its second", now.Add(570 * ms), "", true, ""},
+			{"the replay's read at .9 of its second", now.Add(900 * ms), "", true, ""},
+			{"a value with a fraction a cut stale, the read at .31 of its second", now.Add(310 * ms), w(now.Add(305*ms - col.cut)), true, ""},
+			{"a value with a fraction two cuts stale, the read at .31 of its second", now.Add(310 * ms), w(now.Add(305*ms - 2*col.cut)), false, "it changed (read as standing for the whole " + map[bool]string{true: "100ms", false: "10ms"}[col.cut == 100*ms] + " it is cut to)"},
+			{"a whole second's value a second stale, the read 40 ms into its second", now.Add(40 * ms), "2026-10-29T16:40:01+00:00", true, ""},
+			{"a whole second's value two seconds stale, the read 40 ms into its second", now.Add(40 * ms), "2026-10-29T16:40:00+00:00", false, "made in this call's window: it changed"},
+		} {
+			span := Span{From: row.at.Add(-5 * ms), To: row.at.Add(5 * ms)}
+			v := row.v
+			if v == "" {
+				v = w(row.at)
+			}
+			got, why := CheckClockRead(p, o, str(v), span, true)
+			if got != row.passes || ClockReadHolds(o, str(v), span) != got {
+				t.Errorf("a column cut to %v, %s, %s: passes %v (%s); want %v", col.cut, row.name, v, got, why, row.passes)
+			}
+			if row.names != "" && !strings.Contains(why, row.names) {
+				t.Errorf("a column cut to %v, %s, %s: refused (%s); want the reason to say %q", col.cut, row.name, v, why, row.names)
+			}
+		}
+	}
+}
+
+// clientDriftsIn is an empty DriftCache of keploy mock's client tests in
+// zone.
+func clientDriftsIn(zone *time.Location) *DriftCache {
+	dc := NewDriftCache()
+	dc.zone, dc.clientTests = zone, true
+	return dc
 }

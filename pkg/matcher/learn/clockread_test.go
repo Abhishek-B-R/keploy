@@ -70,8 +70,8 @@ func TestALearnedClockReadIsCheckedAtReplayInItsCallsSpan(t *testing.T) {
 	ln = classify(typed(rec), typed(live))
 	if o, ok := ln.Clock(); ln.Kind != KindClockRead || !ok || !o.Plain() || o.Res < time.Millisecond {
 		t.Fatalf("the typed read: %s %+v,%v (%s); want noise that is a plain read", ln.Kind, o, ok, ln.Why)
-	} else if !ClockReadHolds(o, typed(now), s) || ClockReadHolds(o, typed(now.Add(-30*24*time.Hour)), s) || ClockReadHolds(o, typed(s.To.Add(time.Millisecond)), s) {
-		t.Errorf("the typed read: want the replay's now held, thirty days before and a millisecond past the span not")
+	} else if !ClockReadHolds(o, typed(now), s) || ClockReadHolds(o, typed(now.Add(-30*24*time.Hour)), s) || !ClockReadHolds(o, typed(s.To.Add(time.Millisecond)), s) || ClockReadHolds(o, typed(s.To.Add(2*time.Millisecond)), s) {
+		t.Errorf("the typed read: want the replay's now and a millisecond past the span (a writer that rounds) held, thirty days before and two milliseconds past the span not")
 	}
 
 	id := func(at time.Time) Leaf { return Leaf{Path: "body.id", Type: String, Value: "ord-" + ns(at)} }
@@ -103,37 +103,106 @@ func TestAnEmptyClockReadIsRefusedAtReplaySayingTheLearningsDisagree(t *testing.
 	}
 }
 
-// A value the application cuts coarser than its encoding (a millisecond
-// value written in nanoseconds) is learned as a cut, at the unit above its
-// encoding (readRes: a microsecond above a nanosecond), and a replay refuses
-// it whatever it is, saying so: checked at the nanosecond, it would pass or
-// fail by where its read fell in its millisecond.
-func TestACutClockReadIsRefusedAtReplayNamingTheCut(t *testing.T) {
-	rec := time.Date(2026, 10, 26, 9, 0, 0, 123000000, time.UTC)
-	live := rec.Add(FullRoundLead + 7*time.Millisecond)
-	if r := textClockRead(strconv.FormatInt(rec.UnixNano(), 10), strconv.FormatInt(live.UnixNano(), 10)); r == nil || r.Res != time.Microsecond {
-		t.Fatalf("textClockRead = %+v; want a Res of the microsecond above the nanosecond, a cut", r)
+// A value the application cuts coarser than a millisecond, below its
+// encoding (a second's value written in nanoseconds), shows its cut
+// (readRes: the coarsest step both values are whole multiples of), which
+// the learn step learns (founder decision, 2026-10-27) and a replay checks
+// it at (CheckClockRead): a value cut so stands for its whole cut, so it
+// passes wherever in its second its read fell, one up to a second stale
+// passes, and one stale by more is refused as changed, naming the cut it
+// was read at. A value that is no whole second is checked at its own
+// nanosecond. A cut of a millisecond is learned and checked at the cut the
+// same. An offset whose Res is coarser than the replay's encoding is
+// refused up front, naming both resolutions.
+func TestACutClockReadIsLearnedAndCheckedAtItsCut(t *testing.T) {
+	ns := func(at time.Time) Leaf { return Leaf{Type: String, Value: strconv.FormatInt(at.UnixNano(), 10)} }
+	from := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
+	span := Span{From: from.Add(400 * time.Millisecond), To: from.Add(600 * time.Millisecond)}
+	rec := time.Date(2026, 10, 26, 9, 0, 1, 0, time.UTC)
+	if r := textClockRead(ns(rec).Value, ns(rec.Add(62*time.Second)).Value); r == nil || r.Res != time.Second {
+		t.Fatalf("textClockRead = %+v; want a Res of the second both values are cut to", r)
 	} else {
-		from := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
-		ok, why := CheckClockRead("createdAt", *r, Leaf{Type: String, Value: strconv.FormatInt(from.UnixNano(), 10)}, Span{From: from, To: from.Add(time.Second)}, true)
-		if ok || !strings.Contains(why, "the application cuts its value") {
-			t.Errorf("a cut read: %v %q; want refused naming the cut", ok, why)
+		const p = "createdAt"
+		in := func(at time.Time) Shape {
+			return Shape{Leaves: map[string]Leaf{p: {Path: p, Noise: p, Type: String, Value: ns(at).Value}}}
+		}
+		if ln := ClassifyIn(clockedDrifts(), []string{p}, in(rec.Add(62*time.Second)), in(rec), rec.Add(time.Millisecond), nil, nil, nil, nil)[0]; ln.Kind != KindClockRead || ln.Read == nil || ln.Read.Res != time.Second {
+			t.Errorf("an epoch in nanoseconds cut to the second, at learn: %s Read=%+v (%s); want a clock read learned at its 1s cut", ln.Kind, ln.Read, ln.Why)
+		}
+		if ok, why := CheckClockRead("createdAt", *r, ns(from), span, true); !ok {
+			t.Errorf("a value cut to the second its read fell in: %v %q; want it checked at the cut, and passed", ok, why)
+		}
+		if ok, why := CheckClockRead("createdAt", *r, ns(from.Add(-time.Second)), span, true); !ok {
+			t.Errorf("a value cut to the second before its span's (one cut stale): %v %q; want passed", ok, why)
+		}
+		if ok, why := CheckClockRead("createdAt", *r, ns(from.Add(-2*time.Second)), span, true); ok || !strings.HasSuffix(why, "it changed (read as standing for the whole 1s it is cut to)") {
+			t.Errorf("a value cut to the second two before its span's: %v %q; want refused as changed, naming the cut", ok, why)
+		}
+		if ok, why := CheckClockRead("createdAt", *r, ns(from.Add(500*time.Millisecond+7)), span, true); !ok {
+			t.Errorf("a value no whole second, in the span: %v %q; want it checked at its own nanosecond, and passed", ok, why)
+		}
+		if ok, why := CheckClockRead("createdAt", *r, ns(from.Add(400*time.Millisecond-7)), span, true); ok || !strings.HasSuffix(why, "it changed") {
+			t.Errorf("a value no whole second, 7ns before the span: %v %q; want refused as changed", ok, why)
+		}
+	}
+	rec = time.Date(2026, 10, 26, 9, 0, 0, 123000000, time.UTC)
+	if r := textClockRead(ns(rec).Value, ns(rec.Add(FullRoundLead+7*time.Millisecond)).Value); r == nil || r.Res != time.Millisecond {
+		t.Fatalf("textClockRead = %+v; want a Res of the millisecond both values are cut to", r)
+	} else {
+		late := Span{From: from.Add(5*time.Millisecond + 400*time.Microsecond), To: from.Add(5*time.Millisecond + 600*time.Microsecond)}
+		if ok, why := CheckClockRead("createdAt", *r, ns(from.Add(5*time.Millisecond)), late, true); !ok {
+			t.Errorf("a value cut to the millisecond its read fell in: %v %q; want it checked at the cut, and passed", ok, why)
+		}
+		if ok, why := CheckClockRead("createdAt", *r, ns(from.Add(4*time.Millisecond)), late, true); !ok {
+			t.Errorf("a value cut to the millisecond before its span's (one cut stale): %v %q; want passed", ok, why)
+		}
+		if ok, why := CheckClockRead("createdAt", *r, ns(from.Add(3*time.Millisecond)), late, true); ok || !strings.HasSuffix(why, "it changed (read as standing for the whole 1ms it is cut to)") {
+			t.Errorf("a value cut to the millisecond two before its span's: %v %q; want refused as changed", ok, why)
 		}
 	}
 	// The same for an instant its protocol types: a $date of milliseconds
-	// whose two runs' values are whole seconds is learned with the second's
-	// cut, and refused at replay saying so.
+	// whose two runs' values are whole seconds is learned at the second's
+	// cut, and a replay checks a value cut so at it.
 	const p = "body.at.$date.$numberLong"
 	typed := func(at time.Time) Leaf { return InstantLeaf(p, "body.at", at, time.Millisecond) }
 	sec := time.Date(2026, 10, 26, 9, 0, 0, 0, time.UTC)
 	ln := ClassifyIn(clockedDrifts(), []string{p}, Shape{Leaves: map[string]Leaf{p: typed(sec.Add(61 * time.Second))}}, Shape{Leaves: map[string]Leaf{p: typed(sec)}}, sec.Add(time.Millisecond), nil, nil, nil, nil)[0]
-	o, ok := ln.Clock()
-	if ln.Kind != KindClockRead || !ok || o.Res < time.Second {
-		t.Fatalf("the typed cut read: %s %+v,%v (%s); want noise that is a read at the second's cut", ln.Kind, o, ok, ln.Why)
+	if ln.Kind != KindClockRead || ln.Read == nil || ln.Read.Res != time.Second {
+		t.Errorf("the typed cut read: %s Read=%+v (%s); want a clock read learned at the second's cut", ln.Kind, ln.Read, ln.Why)
+	} else {
+		if ok, why := CheckClockRead("at", *ln.Read, typed(from), span, true); !ok {
+			t.Errorf("a typed value cut to the second its read fell in: %v %q; want passed", ok, why)
+		}
+		if ok, why := CheckClockRead("at", *ln.Read, typed(from.Add(-time.Second)), span, true); !ok {
+			t.Errorf("a typed value cut to the second, a second stale: %v %q; want passed", ok, why)
+		}
+		if ok, why := CheckClockRead("at", *ln.Read, typed(from.Add(-2*time.Second)), span, true); ok || !strings.HasSuffix(why, "it changed (read as standing for the whole 1s it is cut to)") {
+			t.Errorf("a typed value cut to the second, two seconds stale: %v %q; want refused naming the cut", ok, why)
+		}
 	}
-	from := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
-	if ok, why := CheckClockRead("at", o, typed(from), Span{From: from, To: from.Add(time.Second)}, true); ok || !strings.Contains(why, "the application cuts its value") {
-		t.Errorf("a typed cut read: %v %q; want refused naming the cut", ok, why)
+	// An offset learned at a millisecond, against a value written in
+	// nanoseconds: checked at the millisecond (a clock read plus an offset,
+	// then cut, is a clock read, 2026-10-28), as standing for its whole
+	// millisecond: one in the span plus the offset passes, whatever its
+	// nanoseconds; one 395 ms before the span's start plus the offset is
+	// refused, naming the cut.
+	off := models.ClockOffset{Min: 30 * time.Minute, Max: 30*time.Minute + time.Millisecond, Res: time.Millisecond}
+	for _, v := range []time.Time{from.Add(30*time.Minute + 500*time.Millisecond + 7), from.Add(30*time.Minute + 500*time.Millisecond)} {
+		if ok, why := CheckClockRead("expiresAt", off, ns(v), span, true); !ok {
+			t.Errorf("FALSE RED: an offset learned at 1ms, a nanosecond value in the span %s: %v %q; want passed", ns(v).Value, ok, why)
+		}
+	}
+	for _, v := range []time.Time{from.Add(30*time.Minute + 5*time.Millisecond + 7), from.Add(30*time.Minute + 5*time.Millisecond)} {
+		if ok, why := CheckClockRead("expiresAt", off, ns(v), span, true); ok || !strings.HasSuffix(why, "it changed (checked as standing for the whole 1ms the learn step read it cut to)") {
+			t.Errorf("an offset learned at 1ms, a nanosecond value %s: %v %q; want refused naming the 1ms cut", ns(v).Value, ok, why)
+		}
+	}
+	// A window too wide to tell a time to live changed by a minute: refused
+	// saying so, never that the value changed.
+	secOff := models.ClockOffset{Min: 30*time.Minute - 155*time.Millisecond, Max: 30*time.Minute + 368*time.Millisecond, Res: time.Second}
+	wide := Span{From: from, To: from.Add(57 * time.Second)}
+	if ok, why := CheckClockRead("expiresAt", secOff, typed(from.Add(30*time.Minute)), wide, true); ok || !strings.Contains(why, "but this call's window (57s) with the offset's range and three of its cut is no narrower than the minute the offset reads in") || strings.Contains(why, "it changed") {
+		t.Errorf("an offset at a second's cut, a window 57 s wide: %v %q; want refused naming the window", ok, why)
 	}
 }
 
@@ -453,7 +522,9 @@ func TestAWallClockOfNoZoneIsCheckedAtReplayInTheZoneItWasLearnedIn(t *testing.T
 			{"the replay's now in the application's zone", form.leaf(ist)(now.Add(5 * time.Millisecond)), span, true, ""},
 			{"an hour on", form.leaf(ist)(now.Add(time.Hour)), span, false, "it changed"},
 			{"the replay's now written in UTC", form.leaf(time.UTC)(now.Add(5 * time.Millisecond)), span, false, "it changed"},
-			{"the replay's now, the application's zone not told", form.leaf(ist)(now.Add(5 * time.Millisecond)), Span{From: span.From, To: span.To}, false, "keploy cannot tell the application's zone"},
+			// The learn step named the zone (+05:30, models.ClockOffset.AppZone):
+			// a replay reads it there whatever its tracker knows.
+			{"the replay's now, the application's zone not told", form.leaf(ist)(now.Add(5 * time.Millisecond)), Span{From: span.From, To: span.To}, true, ""},
 		} {
 			ok, why := CheckClockRead(p, o, row.live, row.s, true)
 			if ok != row.want || !strings.Contains(why, row.why) || !ok && !strings.HasPrefix(why, p+" was learned as clock, a wall clock of no zone in the application's zone") {
@@ -462,6 +533,16 @@ func TestAWallClockOfNoZoneIsCheckedAtReplayInTheZoneItWasLearnedIn(t *testing.T
 			if got := ClockReadHolds(o, row.live, row.s); got != row.want {
 				t.Errorf("%s, %s: ClockReadHolds %v; want %v", form.what, row.what, got, row.want)
 			}
+		}
+		if o.AppZone != "+05:30" {
+			t.Errorf("%s: learned in a zone of no name at UTC+05:30: %+v; want it named +05:30", form.what, o)
+		}
+		// An old file names no zone: a replay that cannot tell the
+		// application's zone refuses it, saying so.
+		oldFile := o
+		oldFile.AppZone = ""
+		if ok, why := CheckClockRead(p, oldFile, form.leaf(ist)(now.Add(5*time.Millisecond)), Span{From: span.From, To: span.To}, true); ok || !strings.Contains(why, "keploy cannot tell the application's zone") {
+			t.Errorf("%s, an old file, the application's zone not told: %v %q; want refused, saying so", form.what, ok, why)
 		}
 		ln = classifyZoned(ist, false, p, form.leaf(time.UTC)(read), form.leaf(time.UTC)(fRead), call, w)
 		if !zonedRead(ln, models.ZoneUTC) {
@@ -675,8 +756,18 @@ func TestATimeOfDayTheLeadMovedIsAClockReadCheckedModuloTheDay(t *testing.T) {
 				}
 			}
 			if tc.zone != models.ZoneUTC {
-				if ok, why := CheckClockRead(p, o, leaf(todIn(s.To, tc.loc)), Span{From: s.From, To: s.To}, true); ok || !strings.Contains(why, "cannot tell the application's zone") {
-					t.Errorf("%s: the zone unknown at replay: %v (%s); want refused, saying so", at, ok, why)
+				// An old file names no zone (models.ClockOffset.AppZone): a
+				// replay that cannot tell the application's refuses it; one
+				// learned naming it reads it there.
+				oldFile := o
+				oldFile.AppZone = ""
+				if ok, why := CheckClockRead(p, oldFile, leaf(todIn(s.To, tc.loc)), Span{From: s.From, To: s.To}, true); ok || !strings.Contains(why, "cannot tell the application's zone") {
+					t.Errorf("%s: an old file, the zone unknown at replay: %v (%s); want refused, saying so", at, ok, why)
+				}
+				if o.AppZone != "" {
+					if ok, why := CheckClockRead(p, o, leaf(todIn(s.To, tc.loc)), Span{From: s.From, To: s.To}, true); !ok {
+						t.Errorf("%s: learned naming %s, the zone unknown at replay: refused (%s); want read in it", at, o.AppZone, why)
+					}
 				}
 			}
 			other := forms["text"]
@@ -946,9 +1037,11 @@ func TestACallerThatChecksNoClockReadNeverReceivesOneAsNoise(t *testing.T) {
 // in UTC or in the application's zone. The replay's verdict on the
 // application's own value is then one at every hour of the day, whichever
 // zone the application writes and whatever hour it was recorded at, never a
-// pass at one hour and a refusal at another; a date two days off is refused
-// at every hour, and one a day off passes only where it is the other zone's
-// date (the stated limit). For UTC, IST and EDT applications, writing their
+// pass at one hour and a refusal at another; a date a day off either way
+// passes (one cut stale or ahead: models.ClockOffset.holdsRead), one three
+// days off is refused at every hour, and one two days off passes only read
+// in the other zone, under either zone, within a day of the span there (the
+// stated limit). For UTC, IST and EDT applications, writing their
 // own zone's date or UTC's, a text and a typed date, in a call with no
 // window and in one whose window holds the call, recorded at every hour.
 func TestADateOfNoZoneIsCheckedAtEveryHourWhicheverZoneItIsWrittenIn(t *testing.T) {
@@ -999,28 +1092,46 @@ func TestADateOfNoZoneIsCheckedAtEveryHourWhicheverZoneItIsWrittenIn(t *testing.
 						}
 						for rh := 0; rh < 24; rh++ {
 							now := time.Date(2026, 11, 3, rh, 10, 0, 0, time.UTC)
-							s := Span{From: now, To: now.Add(20 * time.Millisecond), Zone: app.zone}
+							s := Span{From: now, To: now.Add(20 * time.Millisecond), Zone: app.zone, Own: true}
 							at := now.Add(5 * time.Millisecond)
 							if ok, why := CheckClockRead(p, o, form.leaf(at, write), s, true); !ok {
 								t.Errorf("%s: the application's own date at %02d:10Z refused (%s)", what, rh, why)
 							}
-							if ok, _ := CheckClockRead(p, o, form.leaf(at.Add(48*time.Hour), write), s, true); ok {
-								t.Errorf("%s: a date two days off at %02d:10Z passed", what, rh)
+							// One day off either way is within one cut of a
+							// day of the span: it passes.
+							for _, d := range []int{-1, 1} {
+								if ok, why := CheckClockRead(p, o, form.leaf(at.AddDate(0, 0, d), write), s, true); !ok {
+									t.Errorf("%s: a date %+d day off at %02d:10Z refused (%s); want passed (one cut stale or ahead)", what, d, rh, why)
+								}
 							}
-							other := day(at, app.zone)
+							// Two days off passes only where it is read in the
+							// other zone, under either zone, within one day of
+							// the span there (the stated limit); three never.
+							other := app.zone
 							if write == app.zone {
-								other = day(at, time.UTC)
+								other = time.UTC
 							}
-							off := form.leaf(at.Add(24*time.Hour), write)
-							passes := o.Zone == models.ZoneEither && day(at.Add(24*time.Hour), write).Equal(other)
-							if ok, _ := CheckClockRead(p, o, off, s, true); ok != passes {
-								t.Errorf("%s: a date a day off at %02d:10Z: passed %v; want %v (only where it is the other zone's date, under either zone)", what, rh, ok, passes)
+							for _, d := range []int{-3, -2, 2, 3} {
+								dd := day(at.AddDate(0, 0, d), write)
+								in := time.Date(dd.Year(), dd.Month(), dd.Day(), 0, 0, 0, 0, other)
+								f, e := s.From.In(other), s.To.In(other)
+								lo := time.Date(f.Year(), f.Month(), f.Day()-1, 0, 0, 0, 0, other)
+								passes := o.Zone == models.ZoneEither && (d == 2 || d == -2) && !in.Before(lo) && !in.After(e.AddDate(0, 0, 1))
+								if ok, _ := CheckClockRead(p, o, form.leaf(at.AddDate(0, 0, d), write), s, true); ok != passes {
+									t.Errorf("%s: a date %+d days off at %02d:10Z: passed %v; want %v (only read in the other zone, under either zone, within one day of the span)", what, d, rh, ok, passes)
+								}
 							}
 						}
 						if o.Zone == models.ZoneEither {
 							now := time.Date(2026, 11, 3, 12, 10, 0, 0, time.UTC)
-							if ok, why := CheckClockRead(p, o, form.leaf(now, write), Span{From: now, To: now.Add(20 * time.Millisecond)}, true); ok || !strings.Contains(why, "keploy cannot tell the application's zone") {
-								t.Errorf("%s: the application's zone not told at replay: %v %q; want refused, saying so", what, ok, why)
+							// An old file names no zone (models.ClockOffset.AppZone).
+							oldFile := o
+							oldFile.AppZone = ""
+							if ok, why := CheckClockRead(p, oldFile, form.leaf(now, write), Span{From: now, To: now.Add(20 * time.Millisecond)}, true); ok || !strings.Contains(why, "keploy could not read the zone of the process that made this call, and the learn step named none") {
+								t.Errorf("%s: an old file, the application's zone not told at replay: %v %q; want refused, saying so", what, ok, why)
+							}
+							if ok, why := CheckClockRead(p, o, form.leaf(now, write), Span{From: now, To: now.Add(20 * time.Millisecond)}, true); o.AppZone == "" || !ok {
+								t.Errorf("%s: learned naming %q, the application's zone not told at replay: %v %q; want read in it", what, o.AppZone, ok, why)
 							}
 							if !strings.HasPrefix(o.String(), "clock, a wall clock of no zone in UTC or in the application's zone") {
 								t.Errorf("%s: String %q", what, o.String())
@@ -1273,6 +1384,63 @@ func TestATimeOfDayBothZonesWindowsHoldIsLearnedInEither(t *testing.T) {
 		ln := classifyZoned(ist, false, p, leaf(todIn(read, tc.loc)), leaf(todIn(fread, tc.loc)), call, window(tc.width))
 		if !todRead(ln, tc.want) {
 			t.Errorf("%s: %s Read=%+v (%s); want a read modulo a day in %s", tc.what, ln.Kind, ln.Read, ln.Why, tc.want)
+		}
+	}
+}
+
+// Santiago's clocks skip from 00:00 to 01:00 on 2026-09-06: a date of no
+// zone for that day is its first instant, 01:00, as Java and JavaScript
+// read it (wallIn), never 23:00 the day before (Go's time.Date). So the
+// day after, that date is one day stale and passes, the date before it is
+// two and is refused, whatever hour the replay runs.
+func TestADateOfNoZoneOnADayWithNoMidnightIsThatDaysFirstInstant(t *testing.T) {
+	const p = "body.day"
+	santiago, err := time.LoadLocation("America/Santiago")
+	if err != nil {
+		t.Skipf("no zone data: %v", err)
+	}
+	text := func(v string) Leaf { return Leaf{Path: p, Noise: p, Type: String, Value: v} }
+	if got, want := wallIn(time.Date(2026, 9, 6, 0, 0, 0, 0, time.UTC).UnixNano(), santiago), time.Date(2026, 9, 6, 4, 0, 0, 0, time.UTC); !got.Equal(want) {
+		t.Fatalf("wallIn of 2026-09-06 00:00 in Santiago = %v, want %v (01:00 -03)", got, want)
+	}
+	// Ahead of UTC too, and over a skipped day: Lord Howe skips 02:00-02:30
+	// on 2026-10-04 (+10:30 to +11), Samoa skipped 2011-12-30 (-10 to +14).
+	for _, row := range []struct {
+		zone       string
+		wall, want time.Time
+	}{
+		{"Australia/Lord_Howe", time.Date(2026, 10, 4, 2, 10, 0, 0, time.UTC), time.Date(2026, 10, 3, 15, 40, 0, 0, time.UTC)},
+		{"Pacific/Apia", time.Date(2011, 12, 30, 12, 0, 0, 0, time.UTC), time.Date(2011, 12, 30, 22, 0, 0, 0, time.UTC)},
+		// Not skipped: as the zone's rules give it, just after a skip.
+		{"Europe/Berlin", time.Date(2026, 3, 29, 3, 10, 0, 0, time.UTC), time.Date(2026, 3, 29, 1, 10, 0, 0, time.UTC)},
+	} {
+		loc, err := time.LoadLocation(row.zone)
+		if err != nil {
+			continue
+		}
+		if got := wallIn(row.wall.UnixNano(), loc); !got.Equal(row.want) || got.Location() != loc {
+			t.Errorf("wallIn of %s in %s = %v, want %v there", row.wall.Format("2006-01-02 15:04"), row.zone, got, row.want.In(loc))
+		}
+	}
+	// Learned in a plain period, the app in Santiago, at an hour its date is
+	// not UTC's: the date is read in the app's zone alone (ZoneApp), so
+	// every hour below reads it through wallIn.
+	call := time.Date(2026, 1, 20, 2, 30, 0, 0, time.UTC)
+	ln := classifyZoned(santiago, false, p, text("2026-01-19"), text("2026-01-20"), call, nil)
+	o, ok := ln.Clock()
+	if !plainRead(ln) || !ok || o.Res != 24*time.Hour || o.Zone != models.ZoneApp {
+		t.Fatalf("learned %s %+v (%s); want a plain read of the clock cut to a day in the application's zone", ln.Kind, o, ln.Why)
+	}
+	for h := 0; h < 24; h++ {
+		from := time.Date(2026, 9, 7, h, 10, 0, 0, santiago)
+		s := Span{From: from, To: from.Add(time.Minute), Zone: santiago}
+		for _, row := range []struct {
+			v    string
+			want bool
+		}{{"2026-09-07", true}, {"2026-09-06", true}, {"2026-09-05", false}} {
+			if ok, why := CheckClockRead(p, o, text(row.v), s, true); ok != row.want {
+				t.Errorf("%s for a span from %s: %v (%s), want %v", row.v, from.Format(time.RFC3339), ok, why, row.want)
+			}
 		}
 	}
 }

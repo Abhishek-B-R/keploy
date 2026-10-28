@@ -128,6 +128,10 @@ type Proxy struct {
 	// whenever its error capture window opens (openTestErrorCapture). Under
 	// the proven switch the parsers find it on their connection's context.
 	learnTracker *learn.Tracker
+	// procZones reads the zone each application process writes a wall
+	// clock of no zone in, from /proc, by the connection's origin PID
+	// (learn.WithProcZone): its calls are learned and checked in it.
+	procZones *learn.ProcZones
 
 	// recordedH2 is the stored set's recorded HTTP/2 destinations, seeded
 	// from the whole recording (SeedRecordedDestinations), for the ALPN a
@@ -1103,8 +1107,19 @@ func New(logger *zap.Logger, info agent.DestInfo, opts *config.Config) *Proxy {
 	proxy.learnTracker.SetClientTests(opts.Agent.MockMode)
 	// The application runs beside the agent, and writes a wall clock of no
 	// zone in its local zone, the agent's own, or in UTC
-	// (learn.Tracker.SetAppZone).
-	proxy.learnTracker.SetAppZone(time.Local)
+	// (learn.Tracker.SetAppZone), read with its name where the agent's TZ or
+	// /etc/localtime gives one, so a learning that depends on it names it
+	// (models.ClockOffset.AppZone). Where keploy cannot read it (a TZ of a
+	// POSIX rule, which Go reads as UTC; a link to no zone file), Go's own
+	// reading, and no learning names it (SetAppZoneUnnamed), as before.
+	tz, tzSet := os.LookupEnv("TZ")
+	if loc, err := learn.ReadZone("/", tz, tzSet); err == nil {
+		proxy.learnTracker.SetAppZone(loc)
+	} else {
+		logger.Debug("keploy cannot read the agent's zone; a learning that depends on the application's zone names no zone, and a replay reads its own", zap.Error(err))
+		proxy.learnTracker.SetAppZoneUnnamed(time.Local)
+	}
+	proxy.procZones = learn.NewProcZones("/proc")
 	proxy.sayLearnWaits()
 
 	// Upstream TLS verification (record.upstreamTls). Only the PRECEDENCE is
@@ -2756,6 +2771,16 @@ func (p *Proxy) handleConnection(ctx context.Context, srcConn net.Conn) error {
 	if proven {
 		parserCtx = containerkey.WithConn(parserCtx, containerkey.Default, fmt.Sprint(clientConnID))
 		parserCtx = learn.WithTracker(parserCtx, p.learnTracker)
+		// The zone of the process that made the connection, by its origin
+		// PID: its calls' clock reads are learned and checked in it, never
+		// in the agent's (a zero zone where keploy cannot read it).
+		if p.procZones != nil {
+			z, zerr := p.procZones.Of(destInfo.KernelPid)
+			if zerr != nil {
+				p.logger.Debug("keploy cannot read the zone of the process that made the connection; its calls are learned naming no zone, and a replay reads the zone the learn step named", zap.Uint32("pid", destInfo.KernelPid), zap.Error(zerr))
+			}
+			parserCtx = learn.WithProcZone(parserCtx, z)
+		}
 	}
 	// A handshake made under parserCtx (a parser's STARTTLS upgrade, MySQL
 	// or Postgres; opportunistic TLS) names its leaf for the IP the client

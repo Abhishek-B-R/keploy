@@ -348,6 +348,7 @@ func (t *Tracker) AwaitRequest(ctx context.Context) error {
 func (t *Tracker) newDrifts() *DriftCache {
 	dc := NewDriftCache()
 	dc.clientTests, dc.zone, dc.appClock = t.clientTests, t.appZone, t.appClock != nil
+	dc.zoneName, dc.zoneNoName = t.drifts.zoneName, t.drifts.zoneNoName
 	return dc
 }
 
@@ -404,14 +405,30 @@ func MockID(m *models.Mock) string {
 // such a value refused, a false red that fails closed. A wall clock of no
 // zone its protocol types (WallClockLeaf) is read in those two zones too
 // where the learn step looks for a read of the clock (instantClock), as a
-// text's is. The agent sets it once, before any test.
-func (t *Tracker) SetAppZone(loc *time.Location) {
+// text's is. The agent sets it once, before any test. A learning that
+// depends on it names it (models.ClockOffset.AppZone, models.ZoneNameOf).
+// It is the agent's own zone: a call whose process's zone the agent read
+// (WithProcZone) is learned and checked in that one instead (DriftsOf,
+// ClockSpanFrom).
+func (t *Tracker) SetAppZone(loc *time.Location) { t.setAppZone(loc, true) }
+
+// SetAppZoneUnnamed is SetAppZone of a zone keploy could not read by name
+// (Go's own reading of a TZ it cannot read, which Go reads as UTC): no
+// learning names it, so a replay reads the zone its own tracker knows, as
+// before the name was stored, never a name the application's zone is not.
+func (t *Tracker) SetAppZoneUnnamed(loc *time.Location) { t.setAppZone(loc, false) }
+
+func (t *Tracker) setAppZone(loc *time.Location, named bool) {
 	if t == nil {
 		return
 	}
+	name := ""
+	if named {
+		name = models.ZoneNameOf(loc, time.Now())
+	}
 	t.mu.Lock()
 	t.appZone = loc
-	t.drifts.zone = loc
+	t.drifts.zone, t.drifts.zoneName, t.drifts.zoneNoName = loc, name, !named
 	t.mu.Unlock()
 }
 
@@ -888,6 +905,18 @@ func (t *Tracker) Drifts() *DriftCache {
 	return t.drifts
 }
 
+// DriftsOf is Drifts read in the zone of the process that made the call ctx
+// serves (WithProcZone; DriftCache.InZone): the application's zone a call's
+// learning depends on is its own process's, never the agent's. Drifts
+// itself where ctx carries none.
+func (t *Tracker) DriftsOf(ctx context.Context) *DriftCache {
+	dc := t.Drifts()
+	if z, ok := procZoneFrom(ctx); ok {
+		return dc.InZone(z)
+	}
+	return dc
+}
+
 // Answered reports whether the running test's own mock name has answered a
 // request of the test: it answers no other. A nil tracker, which knows of no
 // test, answers false.
@@ -1214,8 +1243,9 @@ func (t *Tracker) CallWindowFrom(prevRec time.Time, paired *models.Mock, arrival
 // reads), where it cannot tell the app's clock at either bound, where no
 // bound is known, or where the app's clock did not run as one between the
 // bound and arrival: a replay then cannot check a read of the clock, and
-// refuses it (CheckClockRead). The span carries the application's zone
-// (SetAppZone; Span.Zone).
+// refuses it (CheckClockRead). The span carries the tracker's zone
+// (SetAppZone, the agent's own; Span.Zone), which ClockSpanFrom replaces
+// by the zone of the call's own process where the agent read it.
 func (t *Tracker) LiveSpan(arrival time.Time) (Span, bool) {
 	if t == nil {
 		return Span{}, false

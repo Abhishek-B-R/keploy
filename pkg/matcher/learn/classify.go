@@ -704,7 +704,7 @@ func classifyGiven(dc *DriftCache, drift []string, live, rec Shape, at time.Time
 	}
 	lateEarlier, leafedLate := leafedAtCall(earlier, at)
 	if !ok && len(leafedLate) == 0 {
-		return out
+		return dc.withAppZone(out, at)
 	}
 	if len(leafedLate) > 0 {
 		late = append(append([]Raw(nil), late...), leafedLate...)
@@ -712,6 +712,39 @@ func classifyGiven(dc *DriftCache, drift []string, live, rec Shape, at time.Time
 	alone := classifyRead(dc, drift, live, rec, at, lateEarlier, late, resp, w, given, follow)
 	for i := range out {
 		out[i] = stricterOf(out[i], alone[i])
+	}
+	return dc.withAppZone(out, at)
+}
+
+// withAppZone is out with each clock read whose learning depends on the
+// application's zone (models.ClockOffset.AppZoneMatters: a wall clock of no
+// zone read in it, a value that names its moment cut coarser than a
+// minute) naming the zone dc read it in (DriftCache.zone, zoneName;
+// models.ClockOffset.AppZone), which a replay then reads it in on any
+// machine (CheckClockRead). One keploy cannot name keeps no name, and a
+// replay reads it in the zone its own tracker knows, as before.
+func (dc *DriftCache) withAppZone(out []Learned, at time.Time) []Learned {
+	if dc.zone == nil || dc.zoneNoName {
+		return out
+	}
+	name := dc.zoneName
+	if name == "" {
+		if at.IsZero() {
+			at = time.Now()
+		}
+		name = models.ZoneNameOf(dc.zone, at)
+	}
+	if name == "" {
+		return out
+	}
+	for i := range out {
+		for _, p := range []**models.ClockOffset{&out[i].Offset, &out[i].Read} {
+			if *p != nil && (*p).AppZone == "" && (*p).AppZoneMatters() {
+				o := **p
+				o.AppZone = name
+				*p = &o
+			}
+		}
 	}
 	return out
 }
@@ -1208,7 +1241,7 @@ func classifyRead(dc *DriftCache, drift []string, live, rec Shape, at time.Time,
 		// A time of day whole (textTimeOfDay), which names no day, is a
 		// read modulo a day (textTodRead), checked so at every replay.
 		if ln.Kind == KindNoise && dc.ofIn(r.Value, l.Value, w, at).clock.whole {
-			ln.Read = textClockRead(r.Value, l.Value)
+			ln.Read = textClockReadIn(r.Value, l.Value, dc.zone)
 			if ln.Read == nil {
 				ln.Read = dc.textTodRead(r.Value, l.Value, w, at)
 			}
@@ -1249,7 +1282,7 @@ func classifyRead(dc *DriftCache, drift []string, live, rec Shape, at time.Time,
 				} else {
 					ln.Read = read
 				}
-			} else if read := textClockRead(r.Value, l.Value); read != nil {
+			} else if read := textClockReadIn(r.Value, l.Value, dc.zone); read != nil {
 				switch {
 				case w == nil && !dc.appClock:
 					ln.Kind, ln.Why = KindUnaccounted, noAppClockWhy
@@ -1720,16 +1753,28 @@ type valueDrift struct {
 
 // DriftCache keeps each value's drift for one test of the learn step: the
 // earlier places of a test are read once, not once per request. It also says
-// whose tests they are (ClientTests), which the classifier reads with it.
+// whose tests they are (ClientTests), which the classifier reads with it, and
+// the zone the application writes a wall clock of no zone in. One test's
+// caches share what they keep (driftState); each call reads it in the zone
+// of the process that made the call where keploy read it (InZone).
 type DriftCache struct {
+	*driftState
 	// clientTests: the test is one of keploy mock's client tests
 	// (ClientTests), set as the tracker makes the cache and never after.
 	clientTests bool
 	// zone is the zone the application writes a wall clock of no zone in,
-	// beside UTC (Tracker.SetAppZone), nil for UTC alone: a client test's
-	// window reads such a wall clock in those two only (Window.holdsRead),
-	// and so does the clock rule of one its protocol types (instantClock).
+	// beside UTC (Tracker.SetAppZone, or the call's own process: InZone),
+	// nil for UTC alone: a client test's window reads such a wall clock in
+	// those two only (Window.holdsRead), and so does the clock rule of one
+	// its protocol types (instantClock).
 	zone *time.Location
+	// zoneName is zone's name, as a learning that depends on it names it
+	// (withAppZone; models.ZoneNameOf, read once as the tracker sets it);
+	// zoneNoName: keploy could not read the zone by name (Go's own reading
+	// of a TZ it cannot read, or the agent's own zone where it could not
+	// read the call's process's), so no learning names it.
+	zoneName   string
+	zoneNoName bool
 	// appClock: the tracker knows which clock the application reads
 	// (Tracker.SetAppClock), set as the tracker makes the cache and as the
 	// agent sets the clock. false (a cache made otherwise, NewDriftCache)
@@ -1738,10 +1783,15 @@ type DriftCache struct {
 	// call's window could show a read is refused at learn (noAppClockWhy),
 	// never learned as a read that only a replay refuses.
 	appClock bool
-	mu       sync.Mutex
-	m        map[driftKey]*valueDrift
-	raw      map[string]string
-	rawTok   map[string][]map[string]bool
+}
+
+// driftState is what one test's DriftCaches keep, shared by each zone it
+// is read in (DriftCache.InZone).
+type driftState struct {
+	mu     sync.Mutex
+	m      map[driftKey]*valueDrift
+	raw    map[string]string
+	rawTok map[string][]map[string]bool
 	// mockText is each mock as Classify reads it (RawOf: its text and its
 	// answer's clock reads), by mock: the store's mocks are read once per
 	// test, not once per request.
@@ -1756,6 +1806,29 @@ type DriftCache struct {
 	spans    map[string][]instant
 	blanked  map[string][2]string
 	blankTok map[string][]map[string]bool
+}
+
+// InZone is dc read in z, the zone the process that made a call writes a
+// wall clock of no zone in (ProcZone, as the agent read it from the
+// process), sharing what dc keeps: a learning that depends on the
+// application's zone names z's name where it has one. dc itself where z is
+// not known (keploy could not read the process's zone): the agent's own,
+// which no learning names (a process's zone keploy cannot read may be any).
+func (dc *DriftCache) InZone(z ProcZone) *DriftCache {
+	if dc == nil {
+		return nil
+	}
+	if z.Loc == nil {
+		if dc.zoneNoName {
+			return dc
+		}
+		c := *dc
+		c.zoneName, c.zoneNoName = "", true
+		return &c
+	}
+	c := *dc
+	c.zone, c.zoneName, c.zoneNoName = z.Loc, z.Name, z.Name == ""
+	return &c
 }
 
 // ClientTests reports whether dc is of one of keploy mock's client tests
@@ -1807,7 +1880,7 @@ func (dc *DriftCache) InstantClockRead(rec, live Leaf, w *Window) bool {
 
 // NewDriftCache makes an empty cache.
 func NewDriftCache() *DriftCache {
-	return &DriftCache{m: map[driftKey]*valueDrift{}, raw: map[string]string{}, rawTok: map[string][]map[string]bool{}, mockText: map[*models.Mock]Raw{}, readText: map[*models.Mock]Raw{}, spans: map[string][]instant{}}
+	return &DriftCache{driftState: &driftState{m: map[driftKey]*valueDrift{}, raw: map[string]string{}, rawTok: map[string][]map[string]bool{}, mockText: map[*models.Mock]Raw{}, readText: map[*models.Mock]Raw{}, spans: map[string][]instant{}}}
 }
 
 // ReadRaw is RawOf(m, served) with m's answer read back first when the agent
@@ -1919,6 +1992,11 @@ type driftKey struct {
 	run
 	w    [4]int64
 	call int64
+	// zone is the zone the clock reads were read in (DriftCache.zone): a
+	// test's caches share what they keep across the zones of its calls'
+	// processes (InZone), and a value one zone reads as a clock read
+	// another may not. The key holds it, so it is never another's.
+	zone *time.Location
 }
 
 // of is what the drifted value (rec, live) changed, as an earlier place
@@ -1934,7 +2012,7 @@ func (dc *DriftCache) ofIn(rec, live string, w *Window, call time.Time) *valueDr
 	if !call.IsZero() {
 		at = call.UnixNano()
 	}
-	k := driftKey{run{rec, live}, w.key(), at}
+	k := driftKey{run{rec, live}, w.key(), at, dc.zone}
 	dc.mu.Lock()
 	d, ok := dc.m[k]
 	dc.mu.Unlock()
